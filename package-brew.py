@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 SOURCE = Path(__file__).resolve().parent
 RESOURCES = ("app.py", "lan.py", "peer.py", "app.js", "index.html", "style.css")
 SERVICE = "_neighbor-review._tcp"
@@ -116,6 +116,7 @@ def main():
                 "--keychain-profile", args.notary_profile)
             run("/usr/bin/xcrun", "stapler", "staple", app)
             run("/usr/bin/xcrun", "stapler", "validate", app)
+            run("/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=4", app)
             staged.unlink()
             run("/usr/bin/ditto", "-c", "-k", "--keepParent", app, staged)
         shutil.copy2(staged, archive)
