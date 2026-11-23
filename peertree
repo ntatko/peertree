@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+app_dir=${NEIGHBOR_REVIEW_APP_DIR:-}
+if [ -z "$app_dir" ]; then
+  app_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+fi
+exec python3 -B "$app_dir/app.py" "$@"

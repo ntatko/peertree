@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="neighbor-token" content="__SESSION_TOKEN__">
+  <title>PeerTree</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top"><div class="top-inner">
+    <div class="brand"><span class="brand-icon" aria-hidden="true">⇄</span> PeerTree</div>
+    <div class="top-actions">
+      <button id="team-open" class="quiet">Team settings</button>
+      <span class="avatar" id="avatar" title="Local identity">·</span>
+    </div>
+  </div></header>
+
+  <main>
+    <section class="workspace">
+      <div>
+        <div class="project" id="project">Local workspace</div>
+        <h1>Code review</h1>
+        <label class="worktree-label" for="worktree">Worktree</label>
+        <select id="worktree" aria-label="Active worktree"></select>
+      </div>
+      <div class="workspace-actions">
+        <button id="import" title="Select an exchange ZIP or drop it here">Import exchange</button>
+        <button id="export">Export exchange</button>
+        <button id="share">Share in Finder</button>
+        <button id="new" class="primary">Submit branch for review</button>
+        <input id="file" type="file" accept=".zip,application/zip" hidden>
+      </div>
+    </section>
+
+    <div id="notice" role="status" hidden></div>
+    <section class="nearby" id="nearby" aria-label="Nearby activity" hidden>
+      <div class="row"><strong>Nearby activity</strong><button id="desktop-alerts" hidden>Enable desktop alerts</button></div>
+      <div id="nearby-status" class="help" role="status"></div>
+    </section>
+    <section class="branches" aria-label="Shared branches" id="branches"></section>
+    <div class="layout">
+      <aside class="panel inbox" aria-label="Branch reviews">
+        <div class="panel-heading"><h2>Branch reviews</h2><span id="count" class="count">0</span></div>
+        <div id="list"></div>
+      </aside>
+      <section class="panel details" id="detail" aria-label="Review details"></section>
+    </div>
+  </main>
+
+  <dialog id="proposal-dialog">
+    <form id="proposal-form">
+      <div class="dialog-heading"><h2>Submit branch for review</h2><button class="quiet close" type="button" aria-label="Close">×</button></div>
+      <label>Title<input name="title" maxlength="120" required placeholder="What does this change?"></label>
+      <label>Source branch<select name="source" required></select></label>
+      <label>Merge into<select name="target" required></select></label>
+      <div class="dialog-actions"><button type="button" class="close">Cancel</button><button class="primary" type="submit">Submit for review</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="team-dialog">
+    <div class="dialog-heading"><h2>Team settings</h2><button class="quiet close" type="button" aria-label="Close">×</button></div>
+    <label>Your public key<input id="public-key" readonly></label>
+    <div class="row key-actions"><button id="copy-key" type="button">Copy public key</button><span id="key-status" class="help" role="status"></span></div>
+    <div id="peer-invite" hidden>
+      <label>Your nearby pairing code<input id="peer-code" readonly></label>
+      <div class="row key-actions"><button id="copy-peer-code" type="button">Copy pairing code</button><span id="peer-code-status" class="help" role="status"></span></div>
+    </div>
+    <p class="help">Verify pairing codes or public keys with your teammates in person.</p>
+    <form id="peer-form" class="settings-section">
+      <h3>Trust a teammate</h3>
+      <label>Name<input name="name" required maxlength="80"></label>
+      <label>Pairing code or public key<input name="key" required maxlength="600" placeholder="NR1.… or ssh-ed25519 …"></label>
+      <button type="submit">Add teammate</button>
+    </form>
+    <form id="reset-pairing-form" class="settings-section" hidden>
+      <label>Paired teammate<select id="reset-pairing" name="id" required></select></label>
+      <button type="submit">Reset nearby pairing</button>
+    </form>
+    <form id="integrator-form" class="settings-section">
+      <label>Integrator<select id="integrator" name="id" required></select></label>
+      <p class="help">Choose the same person on all three laptops.</p>
+      <button type="submit">Save integrator</button>
+    </form>
+    <form id="check-form" class="settings-section">
+      <label>Local pipeline command<input id="check-command" name="command" placeholder="./scripts/check.sh" maxlength="1000"></label>
+      <p class="help">Runs with your account in a temporary checkout of the proposed commit.</p>
+      <button type="submit">Save command</button>
+    </form>
+  </dialog>
+</body>
+</html>

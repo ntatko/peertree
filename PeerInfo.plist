@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>local.neighbor-review.peer</string>
+    <key>CFBundleName</key>
+    <string>PeerTree</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Find paired teammates and exchange Git reviews over nearby peer-to-peer Wi-Fi.</string>
+    <key>NSBonjourServices</key>
+    <array><string>_neighbor-review._tcp</string></array>
+</dict>
+</plist>
