@@ -59,6 +59,20 @@ In **Team settings**, each person copies their **nearby pairing code**. Exchange
 
 With both apps open and in range, submitted branches, decisions, and published tips sync automatically. Paired teammates reconnect on later launches. The app verifies signatures before applying records and shows new activity in the browser. Use **Sync dev** or **Sync main** when you're ready to move those local branches. Use `peertree --no-peer` to turn nearby Wi-Fi off.
 
+## Clone from a teammate
+
+Use PeerTree 0.4.0 or later on both Macs. The integrator opens an existing working copy with nearby Wi-Fi enabled and chooses **Publish repository snapshot**. Select the branches you were protecting and the default checkout branch. PeerTree can offer local branches and cached `origin` branch tips. The signed snapshot includes those branches' Git history and the local tags reachable from them. It stays current as the integrator publishes branch tips.
+
+On the new Mac, choose **Clone from Teammate** when opening PeerTree from Applications, or run:
+
+```sh
+peertree clone "./my-project" --project "my-project"
+```
+
+Use an empty destination and the project name shown on the integrator's screen. Exchange pairing codes, add each other in **Team settings**, and designate the teammate providing the snapshot as integrator. With both apps open nearby, the snapshot arrives automatically. Review the branch and tag counts, then click **Check out repository**. PeerTree creates the protected branches and tags locally and opens the default branch. If direct Wi-Fi is unavailable, the integrator can export the same signed snapshot as a ZIP for the new Mac to import.
+
+Use `--object-format sha256` for a SHA-256 project. PeerTree carries Git refs and tracked files. GitLab access rules, merge request state, CI variables, and runner configuration are server-side. LFS objects and submodule repositories need their own approved transfer.
+
 ## Share a ZIP manually
 
 If AirDrop is approved on your managed Macs, click **Share in Finder**. PeerTree creates a temporary exchange ZIP and selects it in Finder. Choose **Share → AirDrop** and pick the recipient. AirDrop uses Bluetooth and a direct Wi-Fi connection between the Macs, independent of the office network. Keep PeerTree open until the transfer completes.

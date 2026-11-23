@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SOURCE = Path(__file__).resolve().parent
 RESOURCES = ("app.py", "lan.py", "peer.py", "app.js", "index.html", "style.css")
 SERVICE = "_neighbor-review._tcp"

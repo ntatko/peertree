@@ -21,14 +21,17 @@
     <section class="workspace">
       <div>
         <div class="project" id="project">Local workspace</div>
-        <h1>Code review</h1>
-        <label class="worktree-label" for="worktree">Worktree</label>
-        <select id="worktree" aria-label="Active worktree"></select>
+        <h1 id="page-title">Code review</h1>
+        <div id="worktree-picker">
+          <label class="worktree-label" for="worktree">Worktree</label>
+          <select id="worktree" aria-label="Active worktree"></select>
+        </div>
       </div>
       <div class="workspace-actions">
         <button id="import" title="Select an exchange ZIP or drop it here">Import exchange</button>
         <button id="export">Export exchange</button>
         <button id="share">Share in Finder</button>
+        <button id="snapshot-open" hidden>Publish repository snapshot</button>
         <button id="new" class="primary">Submit branch for review</button>
         <input id="file" type="file" accept=".zip,application/zip" hidden>
       </div>
@@ -39,8 +42,16 @@
       <div class="row"><strong>Nearby activity</strong><button id="desktop-alerts" hidden>Enable desktop alerts</button></div>
       <div id="nearby-status" class="help" role="status"></div>
     </section>
+    <section class="panel empty-detail" id="clone" aria-label="First repository checkout" hidden>
+      <h2 id="clone-title">Pair with the integrator</h2>
+      <p class="help" id="clone-status"></p>
+      <div class="row clone-actions">
+        <button id="clone-pair" type="button">Open team settings</button>
+        <button id="clone-checkout" type="button" class="primary" hidden>Check out repository</button>
+      </div>
+    </section>
     <section class="branches" aria-label="Shared branches" id="branches"></section>
-    <div class="layout">
+    <div class="layout" id="review-layout">
       <aside class="panel inbox" aria-label="Branch reviews">
         <div class="panel-heading"><h2>Branch reviews</h2><span id="count" class="count">0</span></div>
         <div id="list"></div>
@@ -56,6 +67,19 @@
       <label>Source branch<select name="source" required></select></label>
       <label>Merge into<select name="target" required></select></label>
       <div class="dialog-actions"><button type="button" class="close">Cancel</button><button class="primary" type="submit">Submit for review</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="snapshot-dialog">
+    <form id="snapshot-form">
+      <div class="dialog-heading"><h2>Publish repository snapshot</h2><button class="quiet close" type="button" aria-label="Close">×</button></div>
+      <fieldset class="settings-section">
+        <legend>Protected branches</legend>
+        <div id="snapshot-branches" class="branch-choices"></div>
+      </fieldset>
+      <label>Default checkout branch<select name="default" required></select></label>
+      <p class="help">The snapshot includes history and tags reachable from these branches.</p>
+      <div class="dialog-actions"><button type="button" class="close">Cancel</button><button type="submit" class="primary">Publish snapshot</button></div>
     </form>
   </dialog>
 

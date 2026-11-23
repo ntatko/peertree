@@ -32,11 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let server: Process
     let logs: Pipe
 
-    init(script: URL, repository: URL) {
+    init(script: URL, arguments: [String]) {
         server = Process()
         logs = Pipe()
         server.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        server.arguments = ["-B", script.path, "--repo", repository.path]
+        server.arguments = ["-B", script.path] + arguments
         server.standardOutput = FileHandle.nullDevice
         server.standardError = logs
         var env = ProcessInfo.processInfo.environment
@@ -100,11 +100,37 @@ if !launchedFromFinder {
 let application = NSApplication.shared
 application.setActivationPolicy(.regular)
 application.activate(ignoringOtherApps: true)
+let start = NSAlert()
+start.messageText = "Open a repository"
+start.informativeText = "Open an existing worktree or receive a fresh clone from a paired teammate."
+start.addButton(withTitle: "Open Existing")
+start.addButton(withTitle: "Clone from Teammate")
+start.addButton(withTitle: "Cancel")
+let choice = start.runModal()
+guard choice == .alertFirstButtonReturn || choice == .alertSecondButtonReturn else { exit(0) }
+let cloning = choice == .alertSecondButtonReturn
 let panel = NSOpenPanel()
-panel.message = "Choose a Git repository or worktree to open in PeerTree."
+panel.message = cloning ? "Choose or create an empty folder for the clone."
+    : "Choose a Git repository or worktree to open in PeerTree."
 panel.canChooseDirectories = true
 panel.canChooseFiles = false
+panel.canCreateDirectories = cloning
 guard panel.runModal() == .OK, let repository = panel.url else { exit(0) }
+var launchArguments = ["--repo", repository.path]
+if cloning {
+    let prompt = NSAlert()
+    prompt.messageText = "Project name"
+    prompt.informativeText = "Enter the project name shown on the integrator’s PeerTree window."
+    let input = NSTextField(string: repository.lastPathComponent)
+    input.frame.size.width = 240
+    prompt.accessoryView = input
+    prompt.addButton(withTitle: "Continue")
+    prompt.addButton(withTitle: "Cancel")
+    guard prompt.runModal() == .alertFirstButtonReturn else { exit(0) }
+    let project = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !project.isEmpty else { launchError("Enter the project's name to start the clone."); exit(1) }
+    launchArguments = ["clone", repository.path, "--project", project]
+}
 
 let mainMenu = NSMenu()
 let item = NSMenuItem()
@@ -113,7 +139,7 @@ appMenu.addItem(withTitle: "Quit PeerTree", action: #selector(NSApplication.term
 item.submenu = appMenu
 mainMenu.addItem(item)
 application.mainMenu = mainMenu
-let delegate = AppDelegate(script: script, repository: repository)
+let delegate = AppDelegate(script: script, arguments: launchArguments)
 application.delegate = delegate
 do {
     try delegate.start()

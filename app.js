@@ -173,6 +173,19 @@ function name(id) {
 
 function render() {
   byId("project").textContent = state.project;
+  byId("page-title").textContent = state.bootstrap ? "Clone repository" : "Code review";
+  byId("worktree-picker").hidden = state.bootstrap;
+  byId("review-layout").hidden = state.bootstrap;
+  byId("branches").hidden = state.bootstrap;
+  byId("new").hidden = state.bootstrap;
+  byId("export").hidden = state.bootstrap;
+  byId("share").hidden = state.bootstrap;
+  byId("snapshot-open").hidden = state.bootstrap || state.integrator !== state.me;
+  byId("clone").hidden = !state.bootstrap;
+  if (state.bootstrap) {
+    renderClone();
+    return;
+  }
   options(byId("worktree"), state.worktrees.map(({ path, branch }) =>
     [path, path.split("/").at(-1) + " · " + (branch || "detached HEAD")]), state.repo);
   byId("worktree").title = state.repo;
@@ -199,8 +212,21 @@ function render() {
   renderDetail();
 }
 
+function renderClone() {
+  const { integrator, snapshot } = state;
+  const checkout = byId("clone-checkout");
+  checkout.hidden = !snapshot;
+  byId("clone-title").textContent = snapshot ? "Verified snapshot ready"
+    : integrator ? "Waiting for the repository" : "Pair with the integrator";
+  byId("clone-status").textContent = snapshot
+    ? name(integrator) + " signed " + snapshot.branches.length + " protected branches and " +
+      snapshot.tags + " tags. PeerTree will check out " + snapshot.default + " in " + state.repo + "."
+    : integrator ? "Keep PeerTree open nearby while " + name(integrator) + " publishes the repository snapshot."
+      : "Exchange pairing codes with the teammate sharing the repository, then select them as integrator.";
+}
+
 function renderBranches() {
-  const cards = ["dev", "main"].map(branch => {
+  const cards = state.protected.map(branch => {
     const local = state.branches[branch];
     const published = state.shared[branch];
     const card = element("article", null, "branch");
@@ -338,7 +364,8 @@ function setupTeam() {
   byId("public-key").value = state.public;
   byId("key-status").textContent = "";
   byId("check-command").value = state.check;
-  options(byId("integrator"), Object.entries(state.people), state.integrator, "Choose an integrator");
+  const eligible = Object.entries(state.people).filter(([id]) => !state.bootstrap || id !== state.me);
+  options(byId("integrator"), eligible, state.integrator, "Choose an integrator");
   byId("reset-pairing-form").hidden = state.paired.length === 0;
   options(byId("reset-pairing"), state.paired.map(id => [id, name(id)]));
   updatePairingCode();
@@ -357,11 +384,14 @@ for (const dialog of document.querySelectorAll("dialog")) {
   dialog.addEventListener("close", () => dialog.querySelector(".dialog-error")?.remove());
 }
 
-byId("team-open").addEventListener("click", () => {
+function openTeam() {
   if (!state) return;
   setupTeam();
   byId("team-dialog").showModal();
-});
+}
+byId("team-open").addEventListener("click", openTeam);
+byId("clone-pair").addEventListener("click", openTeam);
+byId("clone-checkout").addEventListener("click", () => change("checkout", {}, null, "Checking out repository…"));
 async function copyFrom(field, status, successMessage) {
   try {
     await navigator.clipboard.writeText(byId(field).value);
@@ -380,12 +410,44 @@ byId("new").addEventListener("click", () => perform(async () => {
   const branches = Object.keys(state.branches);
   const current = state.worktrees.find(worktree => worktree.path === state.repo)?.branch;
   options(form.elements.source, branches.map(branch => [branch, branch]),
-    current && !["main", "dev"].includes(current) ? current :
-      branches.find(branch => !["main", "dev"].includes(branch)));
-  options(form.elements.target, ["dev", "main"].filter(branch => state.branches[branch])
+    current && !state.protected.includes(current) ? current :
+      branches.find(branch => !state.protected.includes(branch)));
+  options(form.elements.target, state.protected.filter(branch => state.branches[branch])
     .map(branch => [branch, branch]));
   byId("proposal-dialog").showModal();
 }));
+byId("snapshot-open").addEventListener("click", () => perform(async () => {
+  await refresh();
+  const form = byId("snapshot-form");
+  const choices = state.snapshot_sources;
+  const selection = byId("snapshot-branches");
+  const initial = new Set(state.protected.filter(branch => choices.includes(branch)));
+  if (!initial.size && choices.length) initial.add(choices[0]);
+  selection.replaceChildren(...choices.map(branch => {
+    const label = element("label");
+    const box = element("input");
+    box.type = "checkbox";
+    box.name = "branches";
+    box.value = branch;
+    box.checked = initial.has(branch);
+    label.append(box, document.createTextNode(branch));
+    return label;
+  }));
+  const updateDefaults = previous => {
+    const chosen = new FormData(form).getAll("branches");
+    options(form.elements.default, chosen.map(ref => [ref, ref]),
+      chosen.includes(previous) ? previous : chosen.includes("main") ? "main" : chosen[0]);
+  };
+  selection.onchange = () => updateDefaults(form.elements.default.value);
+  updateDefaults(state.snapshot?.default);
+  byId("snapshot-dialog").showModal();
+}));
+byId("snapshot-form").addEventListener("submit", event => {
+  event.preventDefault();
+  const fields = new FormData(event.target);
+  change("snapshot", { branches: fields.getAll("branches"), default: fields.get("default") },
+    () => byId("snapshot-dialog").close(), "Publishing repository snapshot…");
+});
 const importButton = byId("import");
 importButton.addEventListener("click", () => byId("file").click());
 importButton.addEventListener("dragover", event => {

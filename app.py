@@ -79,6 +79,15 @@ def short_text(value, limit):
     return isinstance(value, str) and 0 < len(value.strip()) <= limit and len(value) <= limit
 
 
+def ref_name(value):
+    return (short_text(value, 255) and not value.startswith("-")
+            and not re.search(r"[\x00-\x20\x7f~^:?*\[\\]", value))
+
+
+def ref_manifest(value):
+    return isinstance(value, dict) and all(ref_name(ref) and is_hash(oid) for ref, oid in value.items())
+
+
 def validate(record):
     if not isinstance(record, dict) or type(record.get("at")) is not int or record["at"] < 0:
         raise Problem("Invalid record timestamp.")
@@ -86,7 +95,7 @@ def validate(record):
         raise Problem("Invalid record identity.")
     kind = record.get("kind")
     if kind == "proposal":
-        valid = (record.get("target") in BRANCHES and is_hash(record.get("head"))
+        valid = (ref_name(record.get("target")) and is_hash(record.get("head"))
                  and is_hash(record.get("base")) and short_text(record.get("title"), 120)
                  and short_text(record.get("source"), 255))
     elif kind == "review":
@@ -94,7 +103,12 @@ def validate(record):
                  and record.get("vote") in ("approve", "changes")
                  and isinstance(record.get("note"), str) and len(record["note"]) <= 1000)
     elif kind == "shared":
-        valid = record.get("branch") in BRANCHES and is_hash(record.get("head"))
+        valid = ref_name(record.get("branch")) and is_hash(record.get("head"))
+    elif kind == "snapshot":
+        branches, tags = record.get("branches"), record.get("tags")
+        default = record.get("default")
+        valid = (ref_manifest(branches) and branches and ref_manifest(tags)
+                 and ref_name(default) and default in branches)
     else:
         valid = False
     if not valid:
@@ -102,7 +116,7 @@ def validate(record):
 
 
 class Workspace:
-    def __init__(self, repo, project, name, check, lan=None, peer=None):
+    def __init__(self, repo, project, name, check, lan=None, peer=None, bootstrap=False):
         self.root = Path(repo).resolve()
         self.root = Path(self.git("rev-parse", "--show-toplevel").strip())
         self.data = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir").strip())
@@ -137,6 +151,7 @@ class Workspace:
             self.data_state = {
                 "project": project[:80], "name": name[:80], "peers": {}, "integrator": "",
                 "records": {}, "runs": {}, "check": "",
+                "bootstrap": bootstrap,
             }
         if check is not None:
             self.data_state["check"] = check
@@ -292,13 +307,26 @@ class Workspace:
     def pin(self, records):
         commits = {record[field] for record in records
                    for field in ("head", "base") if field in record}
-        if not commits:
-            return
+        tags = set()
+        for record in records:
+            if record["kind"] == "snapshot":
+                for space in ("branches", "tags"):
+                    category = "heads" if space == "branches" else "tags"
+                    for ref in record[space]:
+                        self.git("check-ref-format", f"refs/{category}/{ref}")
+                commits.update(record["branches"].values())
+                tags.update(record["tags"].values())
         for commit in commits:
             if self.commit(commit) != commit:
                 raise Problem("An exchange references a non-commit Git object.")
+        for tag in tags - commits:
+            if self.git("cat-file", "-t", tag).strip() not in ("tag", "commit"):
+                raise Problem("A published tag does not point to a tag or commit object.")
+            self.commit(tag)
+        if not (tags or commits):
+            return
         updates = "".join(f"update refs/neighbor-review/objects/{oid} {oid}\n"
-                          for oid in sorted(commits))
+                          for oid in sorted(commits | tags))
         self.git("update-ref", "--stdin", data=updates.encode())
 
     def store(self, additions):
@@ -321,8 +349,15 @@ class Workspace:
         return {ident for _, ident in latest.values()}
 
     def branches(self):
-        output = self.git("for-each-ref", "--format=%(refname:short)%09%(objectname)", "refs/heads/")
-        return dict(line.split("\t", 1) for line in output.splitlines())
+        return self.refs("refs/heads/")
+
+    def refs(self, prefix):
+        output = self.git("for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)", prefix)
+        rows = (line.split("\t") for line in output.splitlines())
+        return {ref.removeprefix(prefix): oid for ref, oid, symref in rows if not symref}
+
+    def snapshot_sources(self):
+        return {**self.refs("refs/remotes/origin/"), **self.branches()}
 
     def worktrees(self):
         result = []
@@ -342,7 +377,7 @@ class Workspace:
     def create(self, data):
         source, target, title = (data.get(field, "").strip() for field in ("source", "target", "title"))
         branches = self.branches()
-        if source not in branches or target not in BRANCHES or target not in branches:
+        if source not in branches or target not in self.protected_branches() or target not in branches:
             raise Problem("Select an existing source branch and shared target branch.")
         head = branches[source]
         base = self.git("merge-base", branches[target], head).strip()
@@ -453,12 +488,74 @@ class Workspace:
         latest = {}
         for ident, envelope in self.records.items():
             record = envelope["record"]
-            if record["kind"] != "shared" or record["who"] != integrator:
+            if record["who"] != integrator:
                 continue
-            branch = record["branch"]
-            if branch not in latest or (record["at"], ident) > latest[branch][0]:
-                latest[branch] = ((record["at"], ident), record)
-        return {branch: item[1]["head"] for branch, item in latest.items()}
+            tips = record["branches"] if record["kind"] == "snapshot" else (
+                {record["branch"]: record["head"]} if record["kind"] == "shared" else {})
+            for branch, head in tips.items():
+                candidate = ((record["at"], ident), head)
+                if branch not in latest or candidate > latest[branch]:
+                    latest[branch] = candidate
+        return {branch: latest[branch][1] for branch in self.protected_branches() if branch in latest}
+
+    def snapshot(self):
+        integrator = self.data_state["integrator"]
+        candidates = [(item["record"]["at"], ident, item["record"])
+                      for ident, item in self.records.items()
+                      if item["record"]["kind"] == "snapshot" and item["record"]["who"] == integrator]
+        return max(candidates)[2] if candidates else None
+
+    def protected_branches(self):
+        snapshot = self.snapshot()
+        return tuple(snapshot["branches"]) if snapshot else BRANCHES
+
+    def publish_snapshot(self, data):
+        self.require_integrator()
+        refs = self.snapshot_sources()
+        selected, default = data.get("branches"), data.get("default")
+        if (not isinstance(selected, list) or not selected or not all(ref_name(ref) for ref in selected)
+                or not ref_name(default) or default not in selected or any(ref not in refs for ref in selected)):
+            raise Problem("Choose the protected branches and a default branch from the available refs.")
+        branches = {ref: refs[ref] for ref in sorted(set(selected))}
+        for ref, published in self.shared().items():
+            if ref in branches and not self.ancestor(published, branches[ref]):
+                raise Problem(f"{ref} diverged from its last published tip.")
+        all_tags = self.refs("refs/tags/")
+        reachable_tags = set()
+        if all_tags:
+            for tip in set(branches.values()):
+                reachable_tags.update(self.git("tag", "--merged", tip).splitlines())
+        tags = {ref: all_tags[ref] for ref in sorted(reachable_tags)}
+        fields = {"branches": branches, "tags": tags, "default": default}
+        previous = self.snapshot()
+        if not previous or any(previous[field] != value for field, value in fields.items()):
+            ident, envelope = self.sign("snapshot", **fields)
+            self.store({ident: envelope})
+        return {"message": "Repository snapshot published for paired teammates."}
+
+    def bootstrap_checkout(self):
+        if not self.data_state.get("bootstrap"):
+            raise Problem("This repository has already been cloned.")
+        snapshot = self.snapshot()
+        if not snapshot:
+            raise Problem("Choose the integrator and receive their signed repository snapshot first.")
+        branches, tags, default = snapshot["branches"], snapshot["tags"], snapshot["default"]
+        current = self.branches()
+        current_tags = self.refs("refs/tags/")
+        if any(branches.get(ref) != oid for ref, oid in current.items()) or any(
+                tags.get(ref) != oid for ref, oid in current_tags.items()):
+            raise Problem("The destination already contains branches or tags outside the signed snapshot.")
+        if self.git("status", "--porcelain", "--untracked-files=all", "--ignored").strip():
+            raise Problem("The clone destination contains local changes or files. Move them before continuing.")
+        # Checkout before creating refs so an interrupted first checkout can be retried.
+        self.git("switch", "--detach", "--", branches[default])
+        updates = [f"create refs/heads/{ref} {oid}\n" for ref, oid in branches.items() if ref not in current]
+        updates += [f"create refs/tags/{ref} {oid}\n" for ref, oid in tags.items() if ref not in current_tags]
+        if updates:
+            self.git("update-ref", "--stdin", data="".join(updates).encode())
+        self.git("symbolic-ref", "HEAD", f"refs/heads/{default}")
+        self.save({**self.data_state, "bootstrap": False})
+        return {"message": f"Checked out {default}. Protected branches and release tags are ready locally."}
 
     def require_integrator(self):
         if self.data_state["integrator"] != self.me:
@@ -466,6 +563,9 @@ class Workspace:
 
     def publish(self):
         self.require_integrator()
+        snapshot = self.snapshot()
+        if snapshot:
+            return self.publish_snapshot({"branches": list(snapshot["branches"]), "default": snapshot["default"]})
         branches, shared = self.branches(), self.shared()
         additions = {}
         for branch in BRANCHES:
@@ -504,6 +604,8 @@ class Workspace:
     def integrate(self, ident):
         self.require_integrator()
         proposal = self.proposal(ident)
+        if proposal["target"] not in self.protected_branches():
+            raise Problem("This branch is outside the current protected branch list.")
         if ident not in self.revisions():
             raise Problem("A newer revision is available. Merge it after review.")
         reviews = [item for item in self.reviews(ident) if item["who"] != proposal["who"]]
@@ -532,7 +634,9 @@ class Workspace:
             raise Problem(f"Merged into {branch}. Publishing failed, so use Publish branch tips after resolving this issue.\n{error}") from error
 
     def sync(self, branch):
-        if branch not in BRANCHES or branch not in self.shared():
+        if self.data_state.get("bootstrap"):
+            raise Problem("Finish the initial repository checkout before syncing branches.")
+        if branch not in self.shared():
             raise Problem("Import a published tip from your designated integrator first.")
         head = self.shared()[branch]
         current = self.branches().get(branch)
@@ -572,6 +676,8 @@ class Workspace:
             }}
         elif action == "integrator":
             ident = data.get("id")
+            if ident == self.me and state.get("bootstrap"):
+                raise Problem("Select the teammate providing the repository snapshot.")
             if ident != self.me and ident not in state["peers"]:
                 raise Problem("Choose a known teammate.")
             state["integrator"] = ident
@@ -627,16 +733,25 @@ class Workspace:
                 if not isinstance(records, list):
                     raise Problem("Invalid exchange records.")
                 additions = {}
+                bootstrapping = self.data_state.get("bootstrap", False)
+                trusted = {self.me, *self.data_state["peers"]}
                 for envelope in records:
+                    record = envelope.get("record") if isinstance(envelope, dict) else None
+                    if (bootstrapping and isinstance(record, dict)
+                            and is_hash(record.get("who"), FINGERPRINT) and record["who"] not in trusted):
+                        continue
                     ident = self.verified(envelope, directory)
                     if ident not in self.records:
                         additions[ident] = envelope
                 all_records = self.records | additions
-                for item in additions.values():
+                for ident, item in list(additions.items()):
                     record = item["record"]
                     if record["kind"] != "review":
                         continue
                     subject = all_records.get(record["proposal"], {}).get("record", {})
+                    if not subject and bootstrapping:
+                        del additions[ident]
+                        continue
                     if subject.get("kind") != "proposal" or subject["who"] == record["who"]:
                         raise Problem("An exchange contains a review without a valid branch submission.")
                 if additions and "objects.bundle" in names:
@@ -658,6 +773,8 @@ class Workspace:
                         activity.append(f"{name} submitted “{record['title']}” for review.")
                     elif record["kind"] == "review":
                         activity.append(f"{name} reviewed a submitted branch.")
+                    elif record["kind"] == "snapshot":
+                        activity.append(f"{name} published a repository snapshot.")
                     else:
                         activity.append(f"{name} published a new {record['branch']} tip.")
                 return {"message": f"Imported {len(additions)} new exchange records.",
@@ -666,6 +783,7 @@ class Workspace:
     def view(self):
         branches = self.branches()
         shared = self.shared()
+        snapshot = self.snapshot()
         people = {ident: peer["name"] for ident, peer in self.data_state["peers"].items()}
         people[self.me] = self.data_state["name"]
         revisions = self.revisions()
@@ -695,6 +813,10 @@ class Workspace:
             "public": self.public, "people": people, "integrator": self.data_state["integrator"],
             "paired": [who for who, peer in self.data_state["peers"].items() if peer.get("pin")],
             "check": self.data_state["check"], "branches": branches, "shared": shared,
+            "protected": list(self.protected_branches()), "bootstrap": self.data_state.get("bootstrap", False),
+            "snapshot": ({"branches": list(snapshot["branches"]), "tags": len(snapshot["tags"]),
+                          "default": snapshot["default"]} if snapshot else None),
+            "snapshot_sources": list(self.snapshot_sources()) if self.data_state["integrator"] == self.me else [],
             "worktrees": self.worktrees(),
             "proposals": sorted(proposals, key=lambda row: (
                 row["merged"] or row["superseded"], -row["at"])),
@@ -771,6 +893,8 @@ def handle(workspace, token):
                                 "/api/review": lambda: workspace.review(data),
                                 "/api/team": lambda: workspace.team(data),
                                 "/api/publish": workspace.publish,
+                                "/api/snapshot": lambda: workspace.publish_snapshot(data),
+                                "/api/checkout": workspace.bootstrap_checkout,
                                 "/api/sync": lambda: workspace.sync(data.get("branch")),
                                 "/api/integrate": lambda: workspace.integrate(data.get("id")),
                             }
@@ -794,14 +918,35 @@ def handle(workspace, token):
     return Handler
 
 
+def prepare_clone(destination, object_format):
+    root = Path(destination).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if any(root.iterdir()):
+        state_file = root / ".git" / "neighbor-review" / "state.json"
+        if not state_file.is_file() or not json.loads(state_file.read_text()).get("bootstrap"):
+            raise Problem("Choose a new or empty directory for the clone.")
+        if object_format:
+            existing = run(["git", "rev-parse", "--show-object-format"], cwd=root).decode().strip()
+            if existing != object_format:
+                raise Problem(f"This pending clone already uses {existing}.")
+        return root, False
+    else:
+        run(["git", "init", "--quiet", "--initial-branch=peertree-unborn",
+             f"--object-format={object_format or 'sha1'}"], cwd=root)
+    return root, True
+
+
 def main():
     parser = argparse.ArgumentParser(prog="peertree", description="Local Git review for three teammates.")
-    parser.add_argument("--repo", default=".", help="path to an existing Git working copy")
+    parser.add_argument("command", choices=["clone"], nargs="?", help="start a fresh clone from a paired teammate")
+    parser.add_argument("destination", nargs="?", help="new or empty clone directory")
+    parser.add_argument("--repo", help="path to an existing Git working copy")
     parser.add_argument("--project", help="shared project name, defaults to the origin repository name")
     parser.add_argument("--name", help="display name, defaults to Git user.name")
     parser.add_argument("--check", help="local pipeline shell command")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--no-open", action="store_true")
+    parser.add_argument("--object-format", choices=["sha1", "sha256"], help="object format for a fresh clone")
     network = parser.add_mutually_exclusive_group()
     network.add_argument("--lan", dest="lan", action="store_true", default=None,
                          help="enable and remember nearby review alerts")
@@ -816,9 +961,16 @@ def main():
         parser.error("Use a name and project between 1 and 80 characters.")
     if args.check is not None and len(args.check) > 1000:
         parser.error("Keep the check command under 1,000 characters.")
+    if args.command == "clone" and (not args.destination or not args.project or args.repo):
+        parser.error("Use peertree clone DESTINATION --project PROJECT.")
+    if not args.command and (args.destination or args.object_format):
+        parser.error("A destination and object format require the clone command.")
     try:
-        workspace = Workspace(args.repo, args.project and args.project.strip(),
-                              args.name and args.name.strip(), args.check, args.lan, args.peer)
+        bootstrap = args.command == "clone"
+        repo, new_clone = prepare_clone(args.destination, args.object_format) if bootstrap else (args.repo or ".", False)
+        peer = True if new_clone and args.peer is None and args.lan is None else args.peer
+        workspace = Workspace(repo, args.project and args.project.strip(),
+                              args.name and args.name.strip(), args.check, args.lan, peer, bootstrap)
         with ThreadingHTTPServer(("127.0.0.1", args.port), handle(workspace, secrets.token_urlsafe(32))) as server:
             url = f"http://127.0.0.1:{server.server_port}"
             print(f"PeerTree is open at {url}", flush=True)
@@ -839,7 +991,7 @@ def main():
                     workspace.peer_session.close()
                 if workspace.share_folder:
                     workspace.share_folder.cleanup()
-    except (Problem, OSError) as error:
+    except (Problem, OSError, ValueError) as error:
         parser.exit(1, f"{error}\n")
     except KeyboardInterrupt:
         pass
