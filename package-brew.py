@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 SOURCE = Path(__file__).resolve().parent
 RESOURCES = ("app.py", "lan.py", "peer.py", "app.js", "index.html", "style.css")
 SERVICE = "_neighbor-review._tcp"
@@ -83,7 +83,7 @@ def write_cask(path, archive, owner, repository):
   desc "Peer-to-peer Git review and branch sync"
   homepage "https://github.com/{owner}/{repository}"
 
-  depends_on macos: ">= :sequoia"
+  depends_on macos: :sequoia
 
   app "PeerTree.app"
   binary "#{{appdir}}/PeerTree.app/Contents/MacOS/peertree"

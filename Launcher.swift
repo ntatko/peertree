@@ -10,8 +10,17 @@ private func launchError(_ message: String) {
     alert.runModal()
 }
 
+private func executablePath() -> String {
+    // argv[0] is a bare name when the shell finds the Homebrew symlink on PATH.
+    var size: UInt32 = 0
+    _ = _NSGetExecutablePath(nil, &size)
+    var buffer = [CChar](repeating: 0, count: Int(size))
+    guard _NSGetExecutablePath(&buffer, &size) == 0 else { return CommandLine.arguments[0] }
+    return String(cString: buffer)
+}
+
 private func appScript() -> URL? {
-    let invoked = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    let invoked = URL(fileURLWithPath: executablePath()).resolvingSymlinksInPath()
     let resources = [Bundle.main.resourceURL, invoked.deletingLastPathComponent()
         .deletingLastPathComponent().appendingPathComponent("Resources")]
     return resources.compactMap { $0?.appendingPathComponent("app.py") }
