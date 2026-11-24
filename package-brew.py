@@ -11,10 +11,11 @@ import subprocess
 import tempfile
 
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 SOURCE = Path(__file__).resolve().parent
-RESOURCES = ("app.py", "lan.py", "peer.py", "app.js", "index.html", "style.css")
-SERVICE = "_neighbor-review._tcp"
+RESOURCES = ("app.py", "agent.py", "lan.py", "peer.py", "app.js", "index.html", "style.css")
+SERVICE = "_peertree-v2._tcp"
+RUST_TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 
 
 def run(*args):
@@ -38,11 +39,40 @@ def swift(build, source, output, embedded_plist=None):
     run("/usr/bin/lipo", "-create", *compiled, "-output", output)
 
 
-def assemble(build, owner, signing_identity):
+def rust_core(build, output, targets=RUST_TARGETS):
+    compiled = []
+    for target in targets:
+        libdir = subprocess.check_output(["rustc", "--print", "target-libdir", "--target", target],
+                                         text=True).strip()
+        if not Path(libdir).is_dir():
+            raise SystemExit(f"Install the Rust standard library for {target} before building PeerTree.")
+    directory = build / "cargo"
+    for target in targets:
+        run("cargo", "build", "--release", "--locked", "--offline", "--manifest-path", SOURCE / "Cargo.toml",
+            "--target", target, "--target-dir", directory)
+        compiled.append(directory / target / "release" / "peertree-core")
+    run("/usr/bin/lipo", "-create", *compiled, "-output", output)
+
+
+def rust_desktop(build, output):
+    directory = build / "cargo"
+    manifest = SOURCE / "desktop" / "Cargo.toml"
+    compiled = []
+    for target in RUST_TARGETS:
+        flags = ["--locked"] if manifest.with_name("Cargo.lock").is_file() else []
+        run("cargo", "build", "--release", "--manifest-path", manifest, "--features", "custom-protocol",
+            "--target", target, "--target-dir", directory, *flags)
+        compiled.append(directory / target / "release" / "peertree-desktop")
+    run("/usr/bin/lipo", "-create", *compiled, "-output", output)
+
+
+def assemble(build, owner, signing_identity, desktop=False):
     app = build / "PeerTree.app"
     contents = app / "Contents"
     launcher = contents / "MacOS" / "peertree"
+    windowed = launcher.with_name("peertree-desktop")
     helper = contents / "Helpers" / "peertree-peer"
+    core = contents / "Helpers" / "peertree-core"
     resources = contents / "Resources"
     for path in (launcher.parent, helper.parent, resources):
         path.mkdir(parents=True)
@@ -50,7 +80,7 @@ def assemble(build, owner, signing_identity):
         shutil.copy2(SOURCE / name, resources / name)
     info = {
         "CFBundleDisplayName": "PeerTree",
-        "CFBundleExecutable": "peertree",
+        "CFBundleExecutable": windowed.name if desktop else launcher.name,
         "CFBundleIdentifier": f"io.github.{owner.lower()}.peertree",
         "CFBundleName": "PeerTree",
         "CFBundlePackageType": "APPL",
@@ -61,11 +91,17 @@ def assemble(build, owner, signing_identity):
         "NSBonjourServices": [SERVICE],
         "NSHighResolutionCapable": True,
     }
+    if desktop:
+        info.update(plistlib.loads((SOURCE / "desktop" / "Info.plist").read_bytes()))
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
     swift(build, "Launcher.swift", launcher)
     swift(build, "Peer.swift", helper, SOURCE / "PeerInfo.plist")
+    rust_core(build, core)
+    if desktop:
+        rust_desktop(build, windowed)
     signing = ["--options", "runtime", "--timestamp"] if signing_identity else []
-    for item in (helper, app):
+    nested = (helper, core, launcher) if desktop else (helper, core)
+    for item in (*nested, app):
         run("/usr/bin/codesign", "--force", "--sign", signing_identity or "-", *signing, item)
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", app)
     return app
@@ -97,6 +133,7 @@ def main():
     parser.add_argument("--repository", default="peertree", help="GitHub repository name")
     parser.add_argument("--sign-identity", help="Developer ID Application identity for the macOS bundle")
     parser.add_argument("--notary-profile", help="notarytool keychain profile for a release build")
+    parser.add_argument("--desktop", action="store_true", help="bundle the Tauri desktop app")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", args.owner):
         parser.error("Enter a GitHub username or organization.")
@@ -108,7 +145,7 @@ def main():
     output.mkdir(exist_ok=True)
     archive = output / f"PeerTree-{VERSION}-macOS.zip"
     with tempfile.TemporaryDirectory(prefix="peertree-build-") as temporary:
-        app = assemble(Path(temporary), args.owner, args.sign_identity)
+        app = assemble(Path(temporary), args.owner, args.sign_identity, args.desktop)
         staged = Path(temporary) / archive.name
         run("/usr/bin/ditto", "-c", "-k", "--keepParent", app, staged)
         if args.notary_profile:

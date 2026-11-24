@@ -263,7 +263,7 @@ function renderDetail() {
   const heading = element("div", null, "detail-header");
   const meta = element("div", null, "row");
   meta.append(pill(...status(proposal)), element("span", name(proposal.who), "help"),
-    element("span", proposal.approvals + "/2 approvals", "help"));
+    element("span", proposal.approvals + "/" + proposal.required + " approvals", "help"));
   heading.append(meta, element("h2", proposal.title),
     element("code", proposal.source + " → " + proposal.target + "  ·  " + proposal.head.slice(0, 9), "help"));
 
@@ -306,16 +306,22 @@ function renderDetail() {
     const controls = element("div", null, "row");
     controls.append(button("Run local pipeline", () => change("check", { id: proposal.id },
       null, "Running the pipeline for " + proposal.head.slice(0, 9) + "…"), "primary"));
-    controls.firstChild.disabled = !state.check;
+    controls.firstChild.disabled = !!proposal.policy_error || (!proposal.policy && !state.check);
     if (output) controls.append(pill((output.passed ? "Passed" : "Failed") + " · " + output.secs + "s",
       output.passed ? "ok" : "alert"));
     body.append(controls);
-    if (state.check) body.append(element("code", state.check, "help"));
+    if (proposal.policy_error) body.append(element("p", proposal.policy_error, "help"));
+    else if (proposal.policy) {
+      body.append(element("p", proposal.checks.length
+        ? "Required checks · " + proposal.checks.join(", ") : "This policy has no required checks.", "help"));
+      if (proposal.missing.length) body.append(element("p", "Waiting for · " + proposal.missing.join(", "), "help"));
+    } else if (state.check) body.append(element("code", state.check, "help"));
     else body.append(element("p", "Set your pipeline command in Team settings.", "help"));
     if (output) body.append(element("pre", output.output));
   }
 
   if (activeTab === "reviews") {
+    if (proposal.policy_error) body.append(element("p", proposal.policy_error, "help"));
     for (const review of proposal.reviews) {
       const item = element("div", null, "review-item");
       const row = element("div", null, "row");
@@ -327,6 +333,17 @@ function renderDetail() {
       body.append(item);
     }
     if (!proposal.reviews.length) body.append(element("p", "No reviews yet.", "help"));
+    for (const comment of proposal.comments) {
+      const item = element("div", null, "review-item");
+      item.append(element("strong", name(comment.who)), element("p", comment.body, "help"));
+      body.append(item);
+    }
+    const commentField = element("label", "Comment");
+    const commentBody = element("textarea");
+    commentBody.maxLength = 4000;
+    commentField.append(commentBody);
+    body.append(commentField, button("Post comment", () => change("comment",
+      { id: proposal.id, body: commentBody.value })));
     if (proposal.who !== state.me && !proposal.merged && !proposal.superseded) {
       const field = element("label", "Review note");
       const note = element("textarea");
@@ -335,12 +352,15 @@ function renderDetail() {
       field.append(note);
       const actions = element("div", null, "row");
       const approve = button("Approve revision", () => change("review",
-        { id: proposal.id, vote: "approve", note: note.value }), "primary");
-      approve.disabled = !proposal.run?.passed || proposal.run.command !== state.check;
+        { id: proposal.id, revision: proposal.head, vote: "approve", note: note.value }), "primary");
+      approve.disabled = !!proposal.policy_error ||
+        (!proposal.policy && (!proposal.run?.passed || proposal.run.command !== state.check));
       actions.append(approve, button("Request changes", () => change("review",
-        { id: proposal.id, vote: "changes", note: note.value })));
+        { id: proposal.id, revision: proposal.head, vote: "changes", note: note.value })));
       body.append(field, actions);
-      if (approve.disabled) body.append(element("p", "Run a successful local pipeline to approve.", "help"));
+      if (!proposal.policy && !proposal.policy_error && approve.disabled) {
+        body.append(element("p", "Run a successful local pipeline to approve.", "help"));
+      }
     }
     if (proposal.ready && !proposal.merged && !proposal.superseded && state.integrator === state.me) {
       body.append(button("Merge into " + proposal.target, () => change("integrate",

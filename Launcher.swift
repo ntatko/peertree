@@ -27,14 +27,42 @@ private func appScript() -> URL? {
         .first { FileManager.default.isReadableFile(atPath: $0.path) }
 }
 
-private func execCLI(_ args: [String]) -> Never {
-    let executable = "/usr/bin/python3"
+private func execCLI(_ executable: String, _ args: [String]) -> Never {
     let pointers = ([executable] + args).map { strdup($0) } + [nil]
     pointers.withUnsafeBufferPointer { buffer in
         _ = execv(executable, buffer.baseAddress!)
     }
     perror(executable)
     exit(1)
+}
+
+private func agentArguments(_ arguments: [String]) -> [String]? {
+    let values: Set = ["--repo", "--project", "--name", "--check", "--port", "--object-format"]
+    let commands: Set = ["pr", "checks", "sync", "policy", "team", "publish"]
+    var skipValue = false
+    for argument in arguments {
+        if skipValue {
+            skipValue = false
+            continue
+        }
+        if argument == "--agent-help" { return ["--help"] }
+        if argument == "--version" { return ["--version"] }
+        if values.contains(argument) { skipValue = true }
+        else if !argument.hasPrefix("-") { return commands.contains(argument) ? arguments : nil }
+    }
+    return nil
+}
+
+private func desktopArguments(_ arguments: [String]) -> [String]? {
+    if arguments.isEmpty || arguments == ["--peer"] {
+        return ["--repo", FileManager.default.currentDirectoryPath] + arguments
+    }
+    if (arguments.count == 2 || (arguments.count == 3 && arguments[2] == "--peer")),
+       arguments[0] == "--repo" {
+        let folder = URL(fileURLWithPath: arguments[1]).standardizedFileURL.path
+        return ["--repo", folder] + Array(arguments.dropFirst(2))
+    }
+    return nil
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -103,7 +131,18 @@ guard let script = appScript() else {
 }
 
 if !launchedFromFinder {
-    execCLI(["-B", script.path] + arguments)
+    if let selected = agentArguments(arguments) {
+        let core = script.deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Helpers/peertree-core")
+        execCLI(core.path, selected)
+    }
+    let desktop = script.deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("MacOS/peertree-desktop")
+    if let selected = desktopArguments(arguments),
+       FileManager.default.isExecutableFile(atPath: desktop.path) {
+        execCLI(desktop.path, selected)
+    }
+    execCLI("/usr/bin/python3", ["-B", script.path] + arguments)
 }
 
 let application = NSApplication.shared

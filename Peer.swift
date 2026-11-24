@@ -3,8 +3,9 @@ import Foundation
 import Network
 import Security
 
-private let serviceType = "_neighbor-review._tcp"
+private let serviceType = "_peertree-v2._tcp"
 private let maxArchive: UInt64 = 512 * 1024 * 1024
+private let maxInventory = 512 * 1024
 private let chunkSize = 128 * 1024
 
 struct Bootstrap: Decodable {
@@ -99,7 +100,7 @@ final class Transfer {
         }
     }
 
-    func upload(_ archive: URL?) {
+    func upload(_ archive: URL?, recordInventory: @escaping (Data) -> Void) {
         start { [weak self] in
             guard let self else { return }
             do {
@@ -112,14 +113,24 @@ final class Transfer {
                     try handle.seek(toOffset: 0)
                 }
                 let header = withUnsafeBytes(of: length.bigEndian) { Data($0) }
-                self.send(header) { self.uploadChunk(length) }
+                self.send(header) { self.uploadChunk(length, recordInventory: recordInventory) }
             } catch { self.finish(false) }
         }
     }
 
-    private func uploadChunk(_ remaining: UInt64) {
+    private func uploadChunk(_ remaining: UInt64, recordInventory: @escaping (Data) -> Void) {
         guard remaining > 0 else {
-            read(1) { self.finish($0.first == 1) }
+            read(5) { reply in
+                let length = reply.dropFirst().reduce(0) { ($0 << 8) | Int($1) }
+                guard reply.first == 1, length > 0, length <= maxInventory else {
+                    self.finish(false)
+                    return
+                }
+                self.read(length) { inventory in
+                    recordInventory(inventory)
+                    self.finish(true)
+                }
+            }
             return
         }
         do {
@@ -128,18 +139,18 @@ final class Transfer {
                 finish(false)
                 return
             }
-            send(bytes) { self.uploadChunk(remaining - UInt64(count)) }
+            send(bytes) { self.uploadChunk(remaining - UInt64(count), recordInventory: recordInventory) }
         } catch { finish(false) }
     }
 
-    func download(to folder: URL) {
+    func download(to folder: URL, inventory: URL) {
         start { [weak self] in
             guard let self else { return }
             self.read(8) { data in
                 let length = data.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
                 guard length <= maxArchive else { self.finish(false); return }
                 if length == 0 {
-                    self.send(Data([1])) { self.finish(true) }
+                    self.reply(with: inventory)
                     return
                 }
                 let partial = folder.appendingPathComponent(UUID().uuidString).appendingPathExtension("partial")
@@ -150,13 +161,23 @@ final class Transfer {
                 }
                 do {
                     self.file = try FileHandle(forWritingTo: partial)
-                    self.downloadChunk(length, to: partial.deletingPathExtension().appendingPathExtension("zip"))
+                    self.downloadChunk(length, to: partial.deletingPathExtension().appendingPathExtension("zip"),
+                                       inventory: inventory)
                 } catch { self.finish(false) }
             }
         }
     }
 
-    private func downloadChunk(_ remaining: UInt64, to archive: URL) {
+    private func reply(with inventory: URL) {
+        let data = (try? Data(contentsOf: inventory)) ?? Data("[]".utf8)
+        guard !data.isEmpty, data.count <= maxInventory else { finish(false); return }
+        var reply = Data([1])
+        reply.append(withUnsafeBytes(of: UInt32(data.count).bigEndian) { Data($0) })
+        reply.append(data)
+        send(reply) { self.finish(true) }
+    }
+
+    private func downloadChunk(_ remaining: UInt64, to archive: URL, inventory: URL) {
         guard remaining > 0 else {
             do {
                 try file?.close()
@@ -164,7 +185,7 @@ final class Transfer {
                 guard let scratch else { finish(false); return }
                 try FileManager.default.moveItem(at: scratch, to: archive)
                 self.scratch = nil
-                send(Data([1])) { self.finish(true) }
+                reply(with: inventory)
             } catch { finish(false) }
             return
         }
@@ -172,7 +193,7 @@ final class Transfer {
         read(count) { data in
             do {
                 try self.file?.write(contentsOf: data)
-                self.downloadChunk(remaining - UInt64(data.count), to: archive)
+                self.downloadChunk(remaining - UInt64(data.count), to: archive, inventory: inventory)
             } catch { self.finish(false) }
         }
     }
@@ -190,7 +211,6 @@ final class Nearby {
     private var endpoints: [String: NWEndpoint] = [:]
     private var incoming: [UUID: Transfer] = [:]
     private var outgoing: [String: Transfer] = [:]
-    private var sent: [String: String] = [:]
     private var attempted: [String: Date] = [:]
     private var reached: [String: Date] = [:]
     private var issues: [String: String] = [:]
@@ -286,7 +306,7 @@ final class Nearby {
                 }
             }
             for name in self.endpoints.keys where found[name] == nil {
-                self.sent.removeValue(forKey: name)
+                self.attempted.removeValue(forKey: name)
             }
             self.endpoints = found
         }
@@ -299,7 +319,6 @@ final class Nearby {
                 self.browser?.cancel()
                 self.browser = nil
                 self.endpoints = [:]
-                self.sent = [:]
                 self.retry("discovery", because: error)
             default: break
             }
@@ -315,7 +334,8 @@ final class Nearby {
             self?.incoming.removeValue(forKey: transferID)
         }
         incoming[transferID] = transfer
-        transfer.download(to: directory.appendingPathComponent("incoming", isDirectory: true))
+        transfer.download(to: directory.appendingPathComponent("incoming", isDirectory: true),
+                          inventory: directory.appendingPathComponent("inventory.json"))
     }
 
     private func send(to name: String, at endpoint: NWEndpoint, archive: URL?) {
@@ -325,12 +345,16 @@ final class Nearby {
             self.outgoing.removeValue(forKey: name)
             if success {
                 self.reached[name] = Date()
-                if let archive { self.sent[name] = archive.lastPathComponent }
             }
         }
         outgoing[name] = transfer
         attempted[name] = Date()
-        transfer.upload(archive)
+        transfer.upload(archive) { [weak self] inventory in
+            guard let self else { return }
+            let path = self.directory.appendingPathComponent("inventories", isDirectory: true)
+                .appendingPathComponent(name).appendingPathExtension("json")
+            try? inventory.write(to: path, options: .atomic)
+        }
     }
 
     private func readJSON<T: Decodable>(_ name: String, as type: T.Type) -> T? {
@@ -341,22 +365,21 @@ final class Nearby {
     private func tick() {
         let configuredPins = readJSON("peers.json", as: [String: String].self) ?? [:]
         for name in Set(pins.keys).union(configuredPins.keys) where pins[name] != configuredPins[name] {
-            sent.removeValue(forKey: name)
             attempted.removeValue(forKey: name)
             reached.removeValue(forKey: name)
         }
         pins = configuredPins
         ensureListener()
         ensureBrowser()
-        let file = readJSON("current.json", as: String.self)
+        let files = readJSON("exports.json", as: [String: String].self) ?? [:]
         let now = Date()
         for (name, endpoint) in endpoints where pins[name] != nil && outgoing[name] == nil {
-            let hasNewArchive = file != nil && file != sent[name]
+            let file = files[name]
             let sinceAttempt = now.timeIntervalSince(attempted[name] ?? .distantPast)
-            if (hasNewArchive && sinceAttempt >= 4) || sinceAttempt >= 20 {
-                let archive = hasNewArchive ? file.map {
+            if (file != nil && sinceAttempt >= 6) || sinceAttempt >= 20 {
+                let archive = file.map {
                     directory.appendingPathComponent("outgoing", isDirectory: true).appendingPathComponent($0)
-                } : nil
+                }
                 send(to: name, at: endpoint, archive: archive)
             }
         }

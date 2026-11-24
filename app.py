@@ -14,6 +14,7 @@ import secrets
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -22,14 +23,16 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+import agent
 from lan import Announcements
-from peer import PEER_CODE, PeerSession, decode_code
+from peer import PEER_CODE, PeerSession, decode_code, identity
 
 
 BRANCHES = ("dev", "main")
 NAMESPACE = "neighbor-review-v1"
 MAX_EXCHANGE = 512 * 1024 * 1024
 ASSETS = Path(__file__).resolve().parent
+POLICY_FILE = ".peertree.json"
 OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 GIT_ENV = {
@@ -39,6 +42,10 @@ GIT_ENV = {
 
 
 class Problem(RuntimeError):
+    pass
+
+
+class AlreadyOpen(Problem):
     pass
 
 
@@ -88,6 +95,33 @@ def ref_manifest(value):
     return isinstance(value, dict) and all(ref_name(ref) and is_hash(oid) for ref, oid in value.items())
 
 
+def referenced_objects(records):
+    commits = {record[field] for record in records for field in ("head", "base") if field in record}
+    tags = set()
+    for record in records:
+        if record["kind"] == "snapshot":
+            commits.update(record["branches"].values())
+            tags.update(record["tags"].values())
+    return commits, tags
+
+
+def rust_request(operation, request):
+    configured = os.environ.get("PEERTREE_CORE")
+    candidates = [Path(configured)] if configured else [
+        ASSETS.parent / "Helpers" / "peertree-core",
+        ASSETS / "target" / "release" / "peertree-core",
+        ASSETS / "target" / "debug" / "peertree-core",
+    ]
+    executable = next((path for path in candidates if path.is_file()), None)
+    if executable is None:
+        raise Problem("Build the PeerTree Rust core first with cargo build --locked.")
+    return json.loads(run([str(executable), operation], data=request))
+
+
+def rust_policy(request):
+    return rust_request("__policy", request)
+
+
 def validate(record):
     if not isinstance(record, dict) or type(record.get("at")) is not int or record["at"] < 0:
         raise Problem("Invalid record timestamp.")
@@ -101,7 +135,16 @@ def validate(record):
     elif kind == "review":
         valid = (is_hash(record.get("proposal"), FINGERPRINT)
                  and record.get("vote") in ("approve", "changes")
-                 and isinstance(record.get("note"), str) and len(record["note"]) <= 1000)
+                 and isinstance(record.get("note"), str) and len(record["note"]) <= 1000
+                 and ("policy" not in record or is_hash(record["policy"])))
+    elif kind == "comment":
+        valid = is_hash(record.get("proposal"), FINGERPRINT) and short_text(record.get("body"), 4000)
+    elif kind == "check":
+        results = record.get("results")
+        valid = (is_hash(record.get("proposal"), FINGERPRINT) and is_hash(record.get("policy"))
+                 and isinstance(results, dict) and len(results) <= 32 and all(
+                     re.fullmatch(r"[A-Za-z0-9._-]{1,64}", key) and isinstance(value, bool)
+                     for key, value in results.items()))
     elif kind == "shared":
         valid = ref_name(record.get("branch")) and is_hash(record.get("head"))
     elif kind == "snapshot":
@@ -126,7 +169,7 @@ class Workspace:
         try:
             fcntl.flock(self.instance, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise Problem("PeerTree is already open for this repository.") from error
+            raise AlreadyOpen("PeerTree is already open for this repository.") from error
         self.key = self.data / "identity"
         self.file = self.data / "state.json"
         if not self.key.exists():
@@ -141,6 +184,7 @@ class Workspace:
         self.notices = {}
         self.notice_packets = {}
         self.share_folder = None
+        self.tracking_error = ""
         if self.file.exists():
             self.data_state = json.loads(self.file.read_text())
             if project is not None and project != self.data_state["project"]:
@@ -305,17 +349,13 @@ class Workspace:
         return self.git("merge-base", earlier, later).strip() == earlier
 
     def pin(self, records):
-        commits = {record[field] for record in records
-                   for field in ("head", "base") if field in record}
-        tags = set()
+        commits, tags = referenced_objects(records)
         for record in records:
             if record["kind"] == "snapshot":
                 for space in ("branches", "tags"):
                     category = "heads" if space == "branches" else "tags"
                     for ref in record[space]:
                         self.git("check-ref-format", f"refs/{category}/{ref}")
-                commits.update(record["branches"].values())
-                tags.update(record["tags"].values())
         for commit in commits:
             if self.commit(commit) != commit:
                 raise Problem("An exchange references a non-commit Git object.")
@@ -330,8 +370,34 @@ class Workspace:
         self.git("update-ref", "--stdin", data=updates.encode())
 
     def store(self, additions):
+        if not additions:
+            return
+        old_tips = self.shared() if self.data_state.get("tracking") else None
         self.pin([envelope["record"] for envelope in additions.values()])
         self.save({**self.data_state, "records": {**self.records, **additions}})
+        self.update_tracking(old_tips)
+
+    def refresh_tracking(self):
+        snapshot = self.snapshot()
+        default = snapshot["default"] if snapshot else "main"
+        result = rust_request("__tracking", encoded({
+            "root": str(self.root), "tips": self.shared(), "default": default,
+        }))
+        self.tracking_error = ""
+        return result
+
+    def enable_tracking(self):
+        result = self.refresh_tracking()
+        if not self.data_state.get("tracking"):
+            self.save({**self.data_state, "tracking": True})
+        return result
+
+    def update_tracking(self, old_tips):
+        if old_tips is not None and self.shared() != old_tips:
+            try:
+                self.refresh_tracking()
+            except (Problem, OSError, ValueError) as error:
+                self.tracking_error = str(error)
 
     def proposal(self, proposal_id):
         record = self.records.get(proposal_id, {}).get("record", {})
@@ -379,6 +445,9 @@ class Workspace:
         branches = self.branches()
         if source not in branches or target not in self.protected_branches() or target not in branches:
             raise Problem("Select an existing source branch and shared target branch.")
+        policy = self.policy_for(target)
+        if policy and target not in policy[1]["protected_branches"]:
+            raise Problem(f"{target} is outside the committed protected branch list.")
         head = branches[source]
         base = self.git("merge-base", branches[target], head).strip()
         if base == head:
@@ -395,13 +464,14 @@ class Workspace:
             self.announcements.wake()
         return {"selected": ident}
 
-    def reviews(self, proposal_id):
+    def reviews(self, proposal_id, policy_id=None):
         people = self.data_state["peers"] | {self.me: {}}
         latest = {}
         for ident, envelope in self.records.items():
             record = envelope["record"]
             who = record["who"]
-            if record.get("proposal") != proposal_id or who not in people:
+            if (record["kind"] != "review" or record["proposal"] != proposal_id
+                    or who not in people or record.get("policy") != policy_id):
                 continue
             if who not in latest or (record["at"], ident) > latest[who][0]:
                 latest[who] = ((record["at"], ident), record)
@@ -415,16 +485,81 @@ class Workspace:
             raise Problem("A teammate needs to review your branch.")
         if ident not in self.revisions():
             raise Problem("A newer revision is available. Open it to leave a review.")
-        if vote == "approve":
+        if data.get("revision") is not None and data["revision"] != proposal["head"]:
+            raise Problem("The reviewed commit does not match this branch submission.")
+        policy = self.policy_for(proposal["target"])
+        if vote == "approve" and policy is None:
             check = self.data_state["check"]
             result = self.data_state["runs"].get(ident, {})
             if not check or not result.get("passed") or result.get("command") != check:
                 raise Problem("Run a successful local pipeline before approving this revision.")
-        review_id, envelope = self.sign("review", proposal=ident, vote=vote, note=note)
+        fields = {"policy": policy[0]} if policy else {}
+        review_id, envelope = self.sign("review", proposal=ident, vote=vote, note=note, **fields)
         self.store({review_id: envelope})
         message = ("Review saved. Paired teammates receive it when nearby."
                    if self.data_state.get("peer") else "Review saved. Export an exchange to share it.")
         return {"message": message}
+
+    def comment(self, data):
+        ident, body = data.get("id"), data.get("body", "").strip()
+        self.proposal(ident)
+        comment_id, envelope = self.sign("comment", proposal=ident, body=body)
+        self.store({comment_id: envelope})
+        return {"id": comment_id, "message": "Comment saved."}
+
+    def comments(self, ident):
+        records = ((item["record"]["at"], key, item["record"]) for key, item in self.records.items()
+                   if item["record"]["kind"] == "comment" and item["record"]["proposal"] == ident)
+        return [{**record, "id": key} for _, key, record in sorted(records)]
+
+    def policy_at(self, tip):
+        item = self.git("ls-tree", tip, "--", POLICY_FILE).strip()
+        if not item:
+            return None
+        mode, kind, oid = item.split("\t", 1)[0].split()
+        if kind != "blob" or mode not in ("100644", "100755"):
+            raise Problem(".peertree.json must be a regular tracked file.")
+        if int(self.git("cat-file", "-s", oid)) > 65536:
+            raise Problem(".peertree.json exceeds 64 KB.")
+        raw = self.git_bytes("cat-file", "blob", oid)
+        config = rust_policy(b'{"operation":"validate","policy":' + raw + b'}')
+        return oid, config
+
+    def policy_for(self, target):
+        shared = self.shared()
+        local = self.branches()
+        snapshot = self.snapshot()
+        default = snapshot["default"] if snapshot else "main"
+        for branch in dict.fromkeys((target, default)):
+            tip = shared.get(branch) or local.get(branch)
+            policy = self.policy_at(tip) if tip else None
+            if policy:
+                return policy
+        return None
+
+    def merge_gate(self, ident, proposal, policy):
+        reviews = self.reviews(ident, policy[0] if policy else None)
+        if policy:
+            policy_id, config = policy
+            newest = {}
+            for key, item in self.records.items():
+                record = item["record"]
+                if (record["kind"] == "check" and record["proposal"] == ident
+                        and record["policy"] == policy_id
+                        and (record["who"] == self.me or record["who"] in self.data_state["peers"])):
+                    for check, passed in record["results"].items():
+                        slot = (record["who"], check)
+                        candidate = (record["at"], key, passed)
+                        if slot not in newest or candidate > newest[slot]:
+                            newest[slot] = candidate
+            passed = sorted({check for (_, check), result in newest.items() if result[2]})
+            return rust_policy(encoded({"operation": "evaluate", "policy": config,
+                                        "target": proposal["target"], "author": proposal["who"],
+                                        "reviews": reviews, "passed": passed}))
+        approvals = sum(item["vote"] == "approve" for item in reviews)
+        blocked = any(item["vote"] == "changes" for item in reviews)
+        return {"approvals": approvals, "required": 2, "blocked": blocked, "missing": [],
+                "ready": approvals >= 2 and not blocked}
 
     def inspect(self, ident):
         proposal = self.proposal(ident)
@@ -442,46 +577,68 @@ class Workspace:
         return {"stats": stats[:16000], "patch": patch[:300000].decode(errors="replace"),
                 "truncated": len(patch) > 300000}
 
-    def run_check(self, ident):
+    def run_check(self, ident, worktree=None):
         if not self.check_lock.acquire(blocking=False):
             raise Problem("A pipeline is already running.")
         try:
             with self.lock:
                 proposal = self.proposal(ident)
+                policy = self.policy_for(proposal["target"])
                 command = self.data_state["check"]
-                root = self.root
+                root = worktree or self.root
                 object_format = self.git("rev-parse", "--show-object-format", cwd=root).strip()
-            if not command:
+            if policy is None and not command:
                 raise Problem("Set a local pipeline command in Team settings first.")
+            checks = policy[1]["checks"] if policy else {"pipeline": ["/bin/sh", "-c", command]}
+            results = {}
+            output = []
             start = time.monotonic()
             with tempfile.TemporaryDirectory(prefix="neighbor-check-") as tmp:
                 self.git("init", "-q", f"--object-format={object_format}", cwd=tmp)
                 self.git("fetch", "--no-tags", "--", str(root), proposal["head"], cwd=tmp)
                 self.git("checkout", "--detach", "-q", proposal["head"], cwd=tmp)
-                with tempfile.TemporaryFile() as log:
-                    with subprocess.Popen(
-                        ["/bin/sh", "-c", command], cwd=tmp, env=GIT_ENV, stdin=subprocess.DEVNULL,
-                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                    ) as process:
-                        try:
-                            code = process.wait(timeout=600)
-                            footer = f"\nExited with status {code}."
-                        except subprocess.TimeoutExpired:
-                            os.killpg(process.pid, signal.SIGKILL)
-                            process.wait()
-                            code, footer = 1, "\nPipeline timed out after 10 minutes."
-                    size = log.tell()
-                    log.seek(max(0, size - 60000))
-                    output = log.read().decode(errors="replace")
-                    if size > 60000:
-                        output = "[Showing the end of the pipeline output]\n" + output
-            result = {"passed": code == 0, "command": command, "output": output + footer,
+                for name, argv in checks.items():
+                    passed, log = self.execute_check(argv, tmp, start + 600)
+                    results[name] = passed
+                    output.append(f"{name}\n{log}")
+            result = {"passed": all(results.values()), "command": command, "output": "\n\n".join(output)[-60000:],
+                      "checks": results, "policy": policy[0] if policy else None,
                       "secs": round(time.monotonic() - start, 1)}
             with self.lock:
+                if policy:
+                    check_id, envelope = self.sign("check", proposal=ident, policy=policy[0], results=results)
+                    self.store({check_id: envelope})
                 self.save({**self.data_state, "runs": {**self.data_state["runs"], ident: result}})
             return result
         finally:
             self.check_lock.release()
+
+    def execute_check(self, argv, cwd, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, "The pipeline reached its 10-minute limit."
+        with tempfile.TemporaryFile() as log:
+            try:
+                with subprocess.Popen(argv, cwd=cwd, env=GIT_ENV, stdin=subprocess.DEVNULL,
+                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True) as process:
+                    try:
+                        code = process.wait(timeout=remaining)
+                        footer = f"\nExited with status {code}."
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait()
+                        code, footer = 1, "\nPipeline timed out after 10 minutes."
+            except OSError as error:
+                return False, str(error)
+            size = log.tell()
+            log.seek(max(0, size - 60000))
+            output = log.read().decode(errors="replace")
+            if size > 60000:
+                output = "[Showing the end of the check output]\n" + output
+            return code == 0, output + footer
 
     def shared(self):
         integrator = self.data_state["integrator"]
@@ -509,7 +666,17 @@ class Workspace:
         snapshot = self.snapshot()
         return tuple(snapshot["branches"]) if snapshot else BRANCHES
 
-    def publish_snapshot(self, data):
+    def verify_branch_publication(self, branches, authorized):
+        for ref, old in self.shared().items():
+            tip = branches.get(ref)
+            if not tip or tip == old:
+                continue
+            if not self.ancestor(old, tip):
+                raise Problem(f"{ref} diverged from its last published tip.")
+            if authorized.get(ref) != tip and self.policy_for(ref):
+                raise Problem(f"Publish changes to {ref} by merging an approved branch review.")
+
+    def publish_snapshot(self, data, authorized=None):
         self.require_integrator()
         refs = self.snapshot_sources()
         selected, default = data.get("branches"), data.get("default")
@@ -517,9 +684,11 @@ class Workspace:
                 or not ref_name(default) or default not in selected or any(ref not in refs for ref in selected)):
             raise Problem("Choose the protected branches and a default branch from the available refs.")
         branches = {ref: refs[ref] for ref in sorted(set(selected))}
-        for ref, published in self.shared().items():
-            if ref in branches and not self.ancestor(published, branches[ref]):
-                raise Problem(f"{ref} diverged from its last published tip.")
+        previous = self.snapshot()
+        default_policy = self.policy_for(previous["default"] if previous else default)
+        if default_policy and not authorized and set(branches) != set(default_policy[1]["protected_branches"]):
+            raise Problem("Choose every protected branch from the committed PeerTree policy.")
+        self.verify_branch_publication(branches, authorized or {})
         all_tags = self.refs("refs/tags/")
         reachable_tags = set()
         if all_tags:
@@ -527,7 +696,6 @@ class Workspace:
                 reachable_tags.update(self.git("tag", "--merged", tip).splitlines())
         tags = {ref: all_tags[ref] for ref in sorted(reachable_tags)}
         fields = {"branches": branches, "tags": tags, "default": default}
-        previous = self.snapshot()
         if not previous or any(previous[field] != value for field, value in fields.items()):
             ident, envelope = self.sign("snapshot", **fields)
             self.store({ident: envelope})
@@ -563,16 +731,39 @@ class Workspace:
 
     def publish(self):
         self.require_integrator()
+        pending = self.data_state.get("pending_publication", {})
+        authorized = {}
+        for branch, merge in pending.items():
+            if self.shared().get(branch) == merge["from"] and merge["proposal"] in self.revisions():
+                proposal = self.proposal(merge["proposal"])
+                policy = self.policy_for(branch)
+                if self.merge_gate(merge["proposal"], proposal, policy)["ready"]:
+                    authorized[branch] = merge["head"]
+        result = self.publish_tips(authorized)
+        completed = {branch: merge for branch, merge in pending.items()
+                     if self.shared().get(branch) != merge["head"]}
+        if completed != pending:
+            self.save({**self.data_state, "pending_publication": completed})
+        return result
+
+    def publish_tips(self, authorized):
         snapshot = self.snapshot()
         if snapshot:
-            return self.publish_snapshot({"branches": list(snapshot["branches"]), "default": snapshot["default"]})
+            return self.publish_snapshot(
+                {"branches": list(snapshot["branches"]), "default": snapshot["default"]}, authorized,
+            )
         branches, shared = self.branches(), self.shared()
+        default = next((branch for branch in ("main", "dev") if branch in branches), "main")
+        policy = self.policy_for(default)
+        if policy:
+            return self.publish_snapshot({"branches": policy[1]["protected_branches"], "default": default},
+                                         authorized)
+        self.verify_branch_publication({ref: head for ref, head in branches.items() if ref in BRANCHES},
+                                       authorized or {})
         additions = {}
         for branch in BRANCHES:
             if branch not in branches or shared.get(branch) == branches[branch]:
                 continue
-            if branch in shared and not self.ancestor(shared[branch], branches[branch]):
-                raise Problem(f"Local {branch} diverged from the last published tip.")
             ident, envelope = self.sign("shared", branch=branch, head=branches[branch])
             additions[ident] = envelope
         if additions:
@@ -601,25 +792,35 @@ class Workspace:
         if expected is not None and self.commit("HEAD") != expected:
             raise Problem(f"Local {branch} changed during the operation.")
 
-    def integrate(self, ident):
+    def integrate(self, ident, revision=None):
         self.require_integrator()
         proposal = self.proposal(ident)
+        if revision is not None and revision != proposal["head"]:
+            raise Problem("The reviewed commit does not match this branch submission.")
         if proposal["target"] not in self.protected_branches():
             raise Problem("This branch is outside the current protected branch list.")
         if ident not in self.revisions():
             raise Problem("A newer revision is available. Merge it after review.")
-        reviews = [item for item in self.reviews(ident) if item["who"] != proposal["who"]]
-        if sum(item["vote"] == "approve" for item in reviews) < 2:
-            raise Problem("This revision needs two teammate approvals.")
-        if any(item["vote"] == "changes" for item in reviews):
+        policy = self.policy_for(proposal["target"])
+        gate = self.merge_gate(ident, proposal, policy)
+        if gate["blocked"]:
             raise Problem("A reviewer has requested changes.")
+        if gate["approvals"] < gate["required"]:
+            raise Problem(f"This revision has {gate['approvals']} of {gate['required']} required teammate approvals.")
+        if gate["missing"]:
+            raise Problem(f"Required checks have not passed: {', '.join(gate['missing'])}.")
         branch, head = proposal["target"], proposal["head"]
         current = self.commit(f"refs/heads/{branch}")
         if self.ancestor(head, current):
             raise Problem("This revision is already included in the target branch.")
         published = self.shared().get(branch)
+        if policy and current != published:
+            raise Problem(f"Start the merge from the last published {branch} tip.")
         if published and not self.ancestor(published, current):
             raise Problem(f"Local {branch} diverged from the last published tip.")
+        targets = self.snapshot_sources() if self.snapshot() else self.branches()
+        targets = {ref: tip for ref, tip in targets.items() if ref in self.protected_branches()}
+        self.verify_branch_publication(targets, {})
         self.clean_branch(branch, current)
         try:
             self.git("merge", "--no-ff", "--no-edit", "--", head)
@@ -629,6 +830,9 @@ class Workspace:
                 self.git("merge", "--abort")
             raise Problem(f"Git could not merge {proposal['source']}.\n{error}") from error
         try:
+            pending = {**self.data_state.get("pending_publication", {}),
+                       branch: {"from": current, "head": self.commit("HEAD"), "proposal": ident}}
+            self.save({**self.data_state, "pending_publication": pending})
             return self.publish()
         except Problem as error:
             raise Problem(f"Merged into {branch}. Publishing failed, so use Publish branch tips after resolving this issue.\n{error}") from error
@@ -650,6 +854,7 @@ class Workspace:
 
     def team(self, data):
         action = data.get("action")
+        old_tips = self.shared() if self.data_state.get("tracking") and action == "integrator" else None
         state = dict(self.data_state)
         if action == "add":
             name, entry = data.get("name", "").strip(), data.get("key", "").strip()
@@ -689,18 +894,36 @@ class Workspace:
         else:
             raise Problem("Unknown team setting.")
         self.save(state)
+        self.update_tracking(old_tips)
         return {"message": "Team settings saved."}
 
-    def export(self):
+    def inventory_plan(self, remote):
+        return rust_request("__inventory", encoded({"local": list(self.records), "remote": remote}))
+
+    def export(self, plan=None):
+        selected = [self.records[ident] for ident in plan["missing"]] if plan else list(self.records.values())
+        metadata = encoded(selected)
+        if len(metadata) > 2 * 1024 * 1024:
+            raise Problem("The signed exchange records exceed 2 MB.")
         with tempfile.TemporaryDirectory() as tmp:
             bundle = Path(tmp) / "objects.bundle"
-            if self.git("for-each-ref", "refs/neighbor-review/objects/").strip():
+            if plan:
+                wanted, tags = referenced_objects([item["record"] for item in selected])
+                known, known_tags = referenced_objects([self.records[ident]["record"] for ident in plan["common"]])
+                known |= known_tags
+                refs = (wanted | tags) - known
+                if refs:
+                    spec = "".join(f"refs/neighbor-review/objects/{oid}\n" for oid in sorted(refs))
+                    spec += "".join(f"^{oid}\n" for oid in sorted(known))
+                    if self.git_bytes("rev-list", "--objects", "--stdin", data=spec.encode()):
+                        self.git("bundle", "create", str(bundle), "--stdin", data=spec.encode())
+            elif self.git("for-each-ref", "refs/neighbor-review/objects/").strip():
                 self.git("bundle", "create", str(bundle), "--glob=refs/neighbor-review/objects/*")
-                if bundle.stat().st_size > MAX_EXCHANGE - 2 * 1024 * 1024:
-                    raise Problem("The Git bundle exceeds the 512 MB exchange limit.")
+            if bundle.exists() and bundle.stat().st_size > MAX_EXCHANGE - 2 * 1024 * 1024:
+                raise Problem("The Git bundle exceeds the 512 MB exchange limit.")
             memory = io.BytesIO()
             with zipfile.ZipFile(memory, "w") as out:
-                out.writestr("records.json", encoded(list(self.records.values())))
+                out.writestr("records.json", metadata)
                 if bundle.exists():
                     out.write(bundle, "objects.bundle")
             return memory.getvalue()
@@ -746,14 +969,15 @@ class Workspace:
                 all_records = self.records | additions
                 for ident, item in list(additions.items()):
                     record = item["record"]
-                    if record["kind"] != "review":
+                    if record["kind"] not in ("review", "comment", "check"):
                         continue
                     subject = all_records.get(record["proposal"], {}).get("record", {})
                     if not subject and bootstrapping:
                         del additions[ident]
                         continue
-                    if subject.get("kind") != "proposal" or subject["who"] == record["who"]:
-                        raise Problem("An exchange contains a review without a valid branch submission.")
+                    if (subject.get("kind") != "proposal"
+                            or (record["kind"] == "review" and subject["who"] == record["who"])):
+                        raise Problem("An exchange contains a comment, check, or review without a valid submission.")
                 if additions and "objects.bundle" in names:
                     bundle = Path(archive.extract("objects.bundle", directory))
                     self.git("bundle", "verify", str(bundle))
@@ -773,6 +997,10 @@ class Workspace:
                         activity.append(f"{name} submitted “{record['title']}” for review.")
                     elif record["kind"] == "review":
                         activity.append(f"{name} reviewed a submitted branch.")
+                    elif record["kind"] == "comment":
+                        activity.append(f"{name} commented on a submitted branch.")
+                    elif record["kind"] == "check":
+                        activity.append(f"{name} ran local checks on a submitted branch.")
                     elif record["kind"] == "snapshot":
                         activity.append(f"{name} published a repository snapshot.")
                     else:
@@ -787,6 +1015,7 @@ class Workspace:
         people = {ident: peer["name"] for ident, peer in self.data_state["peers"].items()}
         people[self.me] = self.data_state["name"]
         revisions = self.revisions()
+        policies = {}
         proposals = []
         for ident, envelope in self.records.items():
             record = envelope["record"]
@@ -799,13 +1028,25 @@ class Workspace:
                              for candidate in {tip, published} if candidate)
             except Problem:
                 merged = False
-            reviews = self.reviews(ident)
-            approvals = sum(item["vote"] == "approve" for item in reviews)
-            blocked = any(item["vote"] == "changes" for item in reviews)
+            target = record["target"]
+            if target not in policies:
+                try:
+                    policies[target] = (self.policy_for(target), "")
+                except Problem as issue:
+                    policies[target] = (None, str(issue))
+            policy, issue = policies[target]
+            reviews = self.reviews(ident, policy[0] if policy else None)
+            try:
+                gate = self.merge_gate(ident, record, policy) if not issue else {}
+            except Problem as error:
+                gate, issue = {}, str(error)
             proposals.append({
-                **record, "id": ident, "merged": merged, "ready": approvals >= 2 and not blocked,
-                "superseded": ident not in revisions, "blocked": blocked,
-                "approvals": approvals, "reviews": reviews,
+                **record, **{"ready": False, "blocked": False, "approvals": 0, "required": 2,
+                             "missing": []}, **gate,
+                "id": ident, "merged": merged, "superseded": ident not in revisions,
+                "policy": policy[0] if policy else None, "policy_error": issue,
+                "checks": list(policy[1]["checks"]) if policy else [],
+                "reviews": reviews, "comments": self.comments(ident),
                 "run": self.data_state["runs"].get(ident),
             })
         return {
@@ -818,6 +1059,7 @@ class Workspace:
                           "default": snapshot["default"]} if snapshot else None),
             "snapshot_sources": list(self.snapshot_sources()) if self.data_state["integrator"] == self.me else [],
             "worktrees": self.worktrees(),
+            "tracking_error": self.tracking_error,
             "proposals": sorted(proposals, key=lambda row: (
                 row["merged"] or row["superseded"], -row["at"])),
         }
@@ -871,7 +1113,8 @@ def handle(workspace, token):
                         return
             else:
                 size = int(self.headers.get("Content-Length", "0"))
-                limit = MAX_EXCHANGE if path == "/api/import" else 16000
+                limit = (MAX_EXCHANGE if path == "/api/import" else
+                         65536 if path in ("/api/comment", "/api/agent") else 16000)
                 if not 0 < size <= limit:
                     raise Problem("The request is empty or too large.")
                 payload = self.rfile.read(size)
@@ -884,6 +1127,8 @@ def handle(workspace, token):
                         raise Problem("Expected an object.")
                     if path == "/api/check":
                         result = workspace.run_check(data.get("id"))
+                    elif path == "/api/agent":
+                        result = agent.execute(workspace, data, MAX_EXCHANGE, pairing_code)
                     else:
                         with workspace.lock:
                             actions = {
@@ -891,6 +1136,7 @@ def handle(workspace, token):
                                 "/api/share": workspace.share_exchange,
                                 "/api/worktree": lambda: workspace.select_worktree(data.get("path")),
                                 "/api/review": lambda: workspace.review(data),
+                                "/api/comment": lambda: workspace.comment(data),
                                 "/api/team": lambda: workspace.team(data),
                                 "/api/publish": workspace.publish,
                                 "/api/snapshot": lambda: workspace.publish_snapshot(data),
@@ -907,15 +1153,21 @@ def handle(workspace, token):
         def request(self):
             try:
                 self.dispatch()
-            except (Problem, ValueError, TypeError, AttributeError, zipfile.BadZipFile) as error:
+            except (Problem, ValueError, TypeError, AttributeError, KeyError, zipfile.BadZipFile) as error:
                 self.send(400, encoded({"error": str(error)}))
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except OSError as error:
+                self.send(400, encoded({"error": str(error)}))
 
         do_GET = request
         do_POST = request
 
     return Handler
+
+
+def pairing_code(workspace):
+    return identity(workspace.data / "peer-identity", workspace.public, run)[1]
 
 
 def prepare_clone(destination, object_format):
@@ -937,7 +1189,12 @@ def prepare_clone(destination, object_format):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="peertree", description="Local Git review for three teammates.")
+    if sys.argv[1:2] == ["--agent-cli"]:
+        return agent.cli(sys.argv[2:], Workspace, AlreadyOpen, MAX_EXCHANGE, pairing_code)
+    parser = argparse.ArgumentParser(
+        prog="peertree", description="Local Git review for three teammates.",
+        epilog="Use peertree pr --help for branch reviews and peertree --agent-help for agent commands.",
+    )
     parser.add_argument("command", choices=["clone"], nargs="?", help="start a fresh clone from a paired teammate")
     parser.add_argument("destination", nargs="?", help="new or empty clone directory")
     parser.add_argument("--repo", help="path to an existing Git working copy")
@@ -946,6 +1203,7 @@ def main():
     parser.add_argument("--check", help="local pipeline shell command")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--no-open", action="store_true")
+    parser.add_argument("--desktop-ready", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--object-format", choices=["sha1", "sha256"], help="object format for a fresh clone")
     network = parser.add_mutually_exclusive_group()
     network.add_argument("--lan", dest="lan", action="store_true", default=None,
@@ -965,15 +1223,30 @@ def main():
         parser.error("Use peertree clone DESTINATION --project PROJECT.")
     if not args.command and (args.destination or args.object_format):
         parser.error("A destination and object format require the clone command.")
+    workspace = None
     try:
         bootstrap = args.command == "clone"
         repo, new_clone = prepare_clone(args.destination, args.object_format) if bootstrap else (args.repo or ".", False)
         peer = True if new_clone and args.peer is None and args.lan is None else args.peer
-        workspace = Workspace(repo, args.project and args.project.strip(),
-                              args.name and args.name.strip(), args.check, args.lan, peer, bootstrap)
-        with ThreadingHTTPServer(("127.0.0.1", args.port), handle(workspace, secrets.token_urlsafe(32))) as server:
+        try:
+            workspace = Workspace(repo, args.project and args.project.strip(),
+                                  args.name and args.name.strip(), args.check, args.lan, peer, bootstrap)
+        except AlreadyOpen:
+            if not args.desktop_ready:
+                raise
+            port = agent.reuse_desktop(repo, peer is True, args.project.strip() if args.project else None)
+            print(json.dumps({"port": port, "owned": False}), flush=True)
+            return 0
+        token = secrets.token_urlsafe(32)
+        with ThreadingHTTPServer(("127.0.0.1", args.port), handle(workspace, token)) as server:
+            session = workspace.data / agent.SESSION_FILE
+            with tempfile.NamedTemporaryFile(dir=workspace.data, delete=False) as staged:
+                staged.write(encoded({"port": server.server_port, "token": token}))
+            os.replace(staged.name, session)
             url = f"http://127.0.0.1:{server.server_port}"
-            print(f"PeerTree is open at {url}", flush=True)
+            previous_term_handler = None
+            if args.desktop_ready:
+                previous_term_handler = signal.signal(signal.SIGTERM, signal.default_int_handler)
             if workspace.data_state.get("lan"):
                 workspace.announcements = Announcements(workspace.outgoing_notices, workspace.receive_notice)
                 workspace.announcements.start()
@@ -981,21 +1254,34 @@ def main():
                 workspace.peer_session = PeerSession(workspace, run)
                 workspace.peer_session.start()
             try:
-                if not args.no_open:
+                if args.desktop_ready:
+                    print(json.dumps({"port": server.server_port, "owned": True}), flush=True)
+                else:
+                    print(f"PeerTree is open at {url}", flush=True)
+                if not args.no_open and not args.desktop_ready:
                     webbrowser.open(url)
                 server.serve_forever()
             finally:
+                session.unlink(missing_ok=True)
                 if workspace.announcements:
                     workspace.announcements.close()
                 if workspace.peer_session:
                     workspace.peer_session.close()
                 if workspace.share_folder:
                     workspace.share_folder.cleanup()
+                if previous_term_handler is not None:
+                    signal.signal(signal.SIGTERM, previous_term_handler)
     except (Problem, OSError, ValueError) as error:
+        if args.desktop_ready:
+            print(json.dumps({"error": str(error)}), flush=True)
+            return 1
         parser.exit(1, f"{error}\n")
     except KeyboardInterrupt:
         pass
+    finally:
+        if workspace is not None:
+            workspace.instance.close()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

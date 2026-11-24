@@ -13,9 +13,26 @@ brew install --cask ntatko/peertree/peertree
 
 The cask installs **PeerTree.app** and links the `peertree` command. It supports Apple Silicon and Intel on macOS 15 or later. PeerTree uses the Mac's Python 3.9+, Git, and OpenSSH. The Command Line Tools provide these dependencies.
 
-To run directly from source, use the full path to the checked-in `peertree` launcher. Nearby Wi-Fi builds its native helper on demand using the Apple Swift toolchain.
+To run directly from source, build the core with `cargo build --locked --offline` and use the checked-in `./peertree` launcher. Nearby Wi-Fi builds its native helper on demand using the Apple Swift toolchain. The current GitHub cask points to the last published version. The agent commands below are in the 0.5.0 source.
+
+The headless smoke test transfers signed exchanges through three disposable clones. Run it with `python3 -B tests/headless.py` after building the core.
+
+## Native desktop preview
+
+The Tauri launcher opens an existing worktree or starts a clone from a teammate. The review opens in a PeerTree desktop window. Closing it returns to the repository picker. The desktop process owns services it starts and attaches to running headless services for the same worktree.
+
+```sh
+cargo build --locked --offline
+cargo run --manifest-path desktop/Cargo.toml
+```
+
+The first desktop build resolves Tauri crates from crates.io. To open a specific working copy, add `-- --repo /path/to/worktree` to the second command. The agent CLI can run against the same worktree while its review window is open.
 
 ## Build a release
+
+Install the Rust standard libraries for Apple Silicon and Intel on the build Mac before packaging. With rustup, run `rustup target add aarch64-apple-darwin x86_64-apple-darwin`. The Rust core builds offline with the checked-in lockfile.
+
+Pass `--desktop` to bundle the Tauri preview with the usual Homebrew CLI. For a signed release, first test the windowed build on the signing Mac and check in the generated `desktop/Cargo.lock` so both architectures use the same dependency versions.
 
 ```sh
 python3 package-brew.py --owner ntatko
@@ -57,7 +74,55 @@ Use this mode where direct device-to-device transfers are approved. Keep Wi-Fi e
 
 In **Team settings**, each person copies their **nearby pairing code**. Exchange and verify the codes in person, then paste each teammate's code into **Trust a teammate**. Add both teammates on all three Macs. If you previously trusted their public keys, add their pairing codes once to enable encrypted connections. The pairing code contains the review signing key and the certificate fingerprint. Both Macs must present their pinned certificate before a connection carries an exchange.
 
-With both apps open and in range, submitted branches, decisions, and published tips sync automatically. Paired teammates reconnect on later launches. The app verifies signatures before applying records and shows new activity in the browser. Use **Sync dev** or **Sync main** when you're ready to move those local branches. Use `peertree --no-peer` to turn nearby Wi-Fi off.
+With both apps open and in range, submitted branches, comments, check results, decisions, and published tips sync automatically. Paired teammates reconnect on later launches. They compare the signed record IDs they hold and exchange the missing records and Git objects. A teammate can relay a record signed by its original author to another teammate who trusts that signer. Nearby sync uses the new protocol in 0.5.0, so upgrade all three Macs together. Use **Sync dev** or **Sync main** when you're ready to move those local branches. Use `peertree --no-peer` to turn nearby Wi-Fi off.
+
+## Agent CLI and local Git remote
+
+CLI and browser actions share the same signing keys, records, and merge gates. When a repository's app is running, the CLI uses that local service. With the app closed, commands operate on the local repository. Start a background sync session in a terminal with `peertree --peer --no-open`.
+
+```sh
+peertree --agent-help
+peertree pr submit --base dev --title "Describe the change" --json
+peertree pr list --json
+peertree pr show "$PR_ID" --json
+peertree pr diff "$PR_ID"
+peertree checks run "$PR_ID" --json
+peertree pr comment "$PR_ID" --body-file review.md --json
+peertree pr review "$PR_ID" --approve --revision "$COMMIT_SHA" --json
+peertree pr merge "$PR_ID" --revision "$COMMIT_SHA" --json
+```
+
+Use `--json` for a machine-readable result. A completed check run with failing checks exits with status 2. The `team` commands configure identities, pairing, and the integrator without a window.
+
+Run `peertree sync` to create a local Git remote named `team`. It exposes the integrator's published branches, such as `team/dev`, and advances the tracking refs as signed tips arrive. `git fetch team` reads this local replica. Run `peertree sync dev` to fast-forward the local branch when ready.
+
+For a manual transfer, `peertree sync --export exchange.zip` creates a full exchange and `peertree sync --import exchange.zip` receives one. To send a smaller exchange, the receiver first writes their record inventory with `peertree sync --inventory have.json`. The sender runs `peertree sync --export updates.zip --since have.json`.
+
+## Repository merge policy
+
+Add `.peertree.json` to a protected branch, then publish the initial snapshot as the integrator. Use the same scripts in your GitLab CI jobs and in PeerTree. The check values are executable arguments, with one array per named check.
+
+```json
+{
+  "version": 1,
+  "protected_branches": ["main", "dev"],
+  "review": {
+    "required_approvals": 2,
+    "allow_self_approval": false
+  },
+  "checks": {
+    "lint": ["./ci/lint.sh"],
+    "test": ["./ci/test.sh"]
+  }
+}
+```
+
+```sh
+peertree publish --branch main --branch dev --default main
+peertree policy show --base dev --json
+```
+
+The last published target commit supplies the active policy. A branch can change this file through review. Its old policy continues to govern the merge, and signed checks and approvals count against the reviewed commit and policy. Run checks explicitly from a temporary checkout. A repository without a committed policy keeps the existing two-reviewer workflow and its locally configured pipeline command.
 
 ## Clone from a teammate
 

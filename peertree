@@ -4,4 +4,29 @@ app_dir=${NEIGHBOR_REVIEW_APP_DIR:-}
 if [ -z "$app_dir" ]; then
   app_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 fi
+skip_value=false
+for arg in "$@"; do
+  if $skip_value; then
+    skip_value=false
+    continue
+  fi
+  case "$arg" in
+    --repo|--project|--name|--check|--port|--object-format) skip_value=true ;;
+    --agent-help|--version|pr|checks|sync|policy|team|publish)
+      core=${PEERTREE_CORE:-"$app_dir/target/debug/peertree-core"}
+      if [ ! -x "$core" ] && [ -z "${PEERTREE_CORE:-}" ]; then
+        core="$app_dir/target/release/peertree-core"
+      fi
+      if [ ! -x "$core" ]; then
+        echo "Build the PeerTree CLI first with cargo build --locked." >&2
+        exit 1
+      fi
+      export PEERTREE_APP="$app_dir/app.py" PEERTREE_PYTHON=${PEERTREE_PYTHON:-python3}
+      if [ "$arg" = --agent-help ]; then exec "$core" --help; fi
+      exec "$core" "$@"
+      ;;
+    -*) ;;
+    *) break ;;
+  esac
+done
 exec python3 -B "$app_dir/app.py" "$@"
