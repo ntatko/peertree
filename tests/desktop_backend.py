@@ -12,6 +12,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
+from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -45,7 +46,7 @@ def run_main(repo):
     return json.loads(output.getvalue())
 
 
-def web_request(workspace, path, data=None, authorized=True):
+def web_request(workspace, path, data=None, authorized=True, headers=None):
     token = "test-session"
     handler_type = app.handle(workspace, token)
     request = handler_type.__new__(handler_type)
@@ -55,14 +56,15 @@ def web_request(workspace, path, data=None, authorized=True):
     request.headers = {"Host": f"127.0.0.1:{LocalServer.server_port}"}
     if authorized:
         request.headers["X-Neighbor-Token"] = token
+    request.headers.update(headers or {})
     if data is not None:
         payload = data if isinstance(data, bytes) else json.dumps(data).encode()
         request.headers["Content-Length"] = str(len(payload))
         request.rfile = io.BytesIO(payload)
     replies = []
-    request.send = lambda status, body, *_: replies.append((status, body))
+    request.send = lambda status, body, *_, etag=None: replies.append((status, body, etag))
     request.request()
-    status, body = replies[0]
+    status, body, web_request.etag = replies[0]
     return status, json.loads(body) if path.startswith("/api/") and path != "/api/export" else body
 
 
@@ -93,9 +95,15 @@ def run_workspace_ui_test(folder):
     try:
         page = web_request(provider, "/", authorized=False)[1]
         assert b'data-view="reviews"' in page and b'id="repo-mark"' in page
-        assert b'id="embedded-file-icons"' in page
+        assert web_request.etag is None and len(page) < 32 * 1024
         assert b"marked v17.0.5" in web_request(provider, "/assets/marked/marked.umd.js", authorized=False)[1]
-        assert web_request(provider, "/peertree-icon.png", authorized=False)[1].startswith(b"\x89PNG\r\n\x1a\n")
+        assert web_request(provider, "/assets/peertree-mark.png", authorized=False)[1].startswith(b"\x89PNG\r\n\x1a\n")
+        # Static files revalidate by ETag instead of downloading again on every page load.
+        etag = web_request.etag
+        assert web_request(provider, "/assets/peertree-mark.png", authorized=False,
+                           headers={"If-None-Match": etag}) == (304, b"")
+        assert web_request(provider, "/assets/peertree-mark.png", authorized=False,
+                           headers={"If-None-Match": '"stale"'})[0] == 200
         status, raw_theme = web_request(provider, "/assets/seti/theme.json", authorized=False)
         assert status == 200
         theme = json.loads(raw_theme)
@@ -169,7 +177,6 @@ def run_workspace_ui_test(folder):
         review_id = result["selected"]
         draft_policy = worktree / ".peertree.json"
         draft_policy.write_text('{"version":1,"protected_branches":["dev"],'
-                                '"review":{"required_approvals":1},'
                                 '"checks":{"lint":["true"]}}\n')
         draft_view = web_request(provider, "/api/state")[1]
         assert draft_view["policy_in_worktree"] and draft_view["proposals"][0]["policy"] is None
@@ -228,7 +235,6 @@ def run_automatic_pipeline_test(folder):
     git(folder, "init", "-qb", "main", str(repo))
     (repo / ".peertree.json").write_text(json.dumps({
         "version": 1, "protected_branches": ["main"],
-        "review": {"required_approvals": 2},
         "checks": {"test": ["python3", "check.py"]},
     }))
     (repo / "check.py").write_text(
@@ -279,6 +285,47 @@ def run_automatic_pipeline_test(folder):
         receiver.instance.close()
 
 
+def run_batched_catch_up_test(folder):
+    repo = folder / "source"
+    peer = folder / "peer"
+
+    def git(cwd, *args):
+        return app.run(["git", "-c", "user.name=Batch", "-c", "user.email=test@example.invalid", *args], cwd=cwd)
+
+    git(folder, "init", "-qb", "main", str(repo))
+    (repo / "file").write_text("base\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "Base")
+    git(folder, "clone", "-q", str(repo), str(peer))
+    workspace = app.Workspace(repo, "Batch demo", "Author", None)
+    receiver = app.Workspace(peer, "Batch demo", "Reviewer", None)
+    try:
+        receiver.team({"action": "add", "name": "Author", "key": workspace.public})
+        for number in range(3):
+            git(repo, "switch", "-qc", f"feature-{number}", "main")
+            (repo / "file").write_text(f"change {number}\n")
+            git(repo, "commit", "-qam", f"Change {number}")
+            ident = workspace.create({"source": f"feature-{number}", "target": "main", "title": f"Change {number}"})
+            for reply in range(3):
+                workspace.comment({"id": ident["selected"], "body": f"Note {number}.{reply}"})
+        # A tiny packet budget makes the teammate catch up over several exchanges.
+        batches = []
+        with patch.object(app, "MAX_RECORDS", 3000):
+            while (plan := workspace.inventory_plan(list(receiver.records)))["missing"]:
+                payload = workspace.export(plan)
+                with ZipFile(io.BytesIO(payload)) as archive:
+                    batches.append([item["record"]["kind"] for item in json.loads(archive.read("records.json"))])
+                assert receiver.import_exchange(payload)["imported"] == len(batches[-1])
+                assert len(batches) < 30
+        kinds = [kind for batch in batches for kind in batch]
+        assert len(batches) > 2 and kinds.count("proposal") == 3 and kinds.count("comment") == 9, batches
+        assert kinds.index("comment") > max(index for index, kind in enumerate(kinds) if kind == "proposal")
+        assert set(receiver.records) == set(workspace.records)
+    finally:
+        workspace.instance.close()
+        receiver.instance.close()
+
+
 def run_test(repo):
     with patch.object(app, "ThreadingHTTPServer", LocalServer):
         assert run_main(repo) == {"port": LocalServer.server_port, "owned": True}
@@ -313,4 +360,7 @@ if __name__ == "__main__":
         run_workspace_ui_test(Path(temporary).resolve())
     with tempfile.TemporaryDirectory(prefix="peertree-automatic-pipeline-test-") as temporary:
         run_automatic_pipeline_test(Path(temporary).resolve())
-    print("Passed desktop startup, repository browser, settings, signed reviews, automatic pipelines, and clone checks.")
+    with tempfile.TemporaryDirectory(prefix="peertree-batched-catch-up-test-") as temporary:
+        run_batched_catch_up_test(Path(temporary).resolve())
+    print("Passed desktop startup, repository browser, settings, signed reviews, automatic pipelines, "
+          "batched catch-up, and clone checks.")

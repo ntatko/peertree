@@ -27,20 +27,6 @@ let nearbyPeer;
 let displayedStorage;
 let fileThemeRequest;
 
-const logo = byId("repo-mark");
-if (logo?.dataset.png && typeof createImageBitmap === "function") {
-  const bytes = assetBytes(logo.dataset.png);
-  createImageBitmap(new Blob([bytes], { type: "image/png" })).then(bitmap => {
-    logo.getContext("2d").drawImage(bitmap, 0, 0);
-    bitmap.close();
-    logo.classList.add("mark-loaded");
-  }).catch(() => {});
-}
-
-function assetBytes(base64) {
-  return Uint8Array.from(atob(base64), char => char.charCodeAt(0));
-}
-
 function element(tag, text, className) {
   const node = document.createElement(tag);
   if (text != null) node.textContent = text;
@@ -403,17 +389,6 @@ function goToPath(path, anchor = "") {
 
 function loadFileTheme() {
   fileThemeRequest ??= (async () => {
-    const embedded = byId("embedded-file-icons")?.textContent;
-    if (embedded) {
-      try {
-        const pack = JSON.parse(embedded);
-        const font = new FontFace("PeerTree Seti", assetBytes(pack.font));
-        document.fonts.add(await font.load());
-        return pack.theme;
-      } catch {
-        // The standalone font is also available when this WebView cannot register it from bytes.
-      }
-    }
     const response = await fetch("/assets/seti/theme.json");
     return response.ok ? response.json() : null;
   })().catch(() => {

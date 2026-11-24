@@ -11,6 +11,7 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "peertree"
 POLICY = {
     "version": 1,
     "protected_branches": ["main", "dev"],
+    # A pre-0.5.1 review section still parses; the integrator workflow requires two approvals.
     "review": {"required_approvals": 2, "allow_self_approval": False},
     "checks": {"lint": ["/bin/sh", "./lint.sh"], "test": ["/bin/sh", "./test.sh"]},
 }
@@ -83,7 +84,7 @@ def run_test(root):
 
     git(alex, "switch", "-qc", "feature", "dev")
     (alex / "code").write_text("new\n")
-    future = {**POLICY, "review": {"required_approvals": 1}, "checks": {}}
+    future = {"version": 1, "protected_branches": ["main", "dev"], "checks": {}}
     (alex / ".peertree.json").write_text(json.dumps(future))
     git(alex, "add", ".")
     git(alex, "commit", "-qm", "Change code and propose changing policy")

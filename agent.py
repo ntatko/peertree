@@ -225,7 +225,7 @@ def act(workspace, request, max_exchange, identity_for):
             path = Path(request["export_path"])
             plan = None
             if request.get("since"):
-                inventory = json.loads(limited_text(Path(request["since"]), 1_048_576))
+                inventory = json.loads(limited_text(Path(request["since"]), 64 * 1024 * 1024))
                 plan = workspace.inventory_plan(inventory)
             write_new(path, workspace.export(plan))
             return {"path": str(path), "message": f"Exported exchange to {path}."}

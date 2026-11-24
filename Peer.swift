@@ -5,7 +5,9 @@ import Security
 
 private let serviceType = "_peertree-v2._tcp"
 private let maxArchive: UInt64 = 512 * 1024 * 1024
-private let maxInventory = 512 * 1024
+// Inventories travel in packets so large record histories never need one huge read.
+private let maxPacket = 512 * 1024
+private let maxInventory = 64 * 1024 * 1024
 private let chunkSize = 128 * 1024
 
 struct Bootstrap: Decodable {
@@ -54,6 +56,7 @@ final class Transfer {
     private var file: FileHandle?
     private var scratch: URL?
     private var didFinish = false
+    private var inventory = Data()
 
     init(_ connection: NWConnection, queue: DispatchQueue, finished: @escaping (Bool) -> Void) {
         self.connection = connection
@@ -121,14 +124,17 @@ final class Transfer {
     private func uploadChunk(_ remaining: UInt64, recordInventory: @escaping (Data) -> Void) {
         guard remaining > 0 else {
             read(5) { reply in
-                let length = reply.dropFirst().reduce(0) { ($0 << 8) | Int($1) }
-                guard reply.first == 1, length > 0, length <= maxInventory else {
+                let value = reply.dropFirst().reduce(0) { ($0 << 8) | Int($1) }
+                switch reply.first {
+                case 1 where value > 0 && value <= maxPacket:
+                    self.read(value) { inventory in
+                        recordInventory(inventory)
+                        self.finish(true)
+                    }
+                case 2 where value > 1 && value <= maxInventory / maxPacket:
+                    self.readPackets(value, recordInventory: recordInventory)
+                default:
                     self.finish(false)
-                    return
-                }
-                self.read(length) { inventory in
-                    recordInventory(inventory)
-                    self.finish(true)
                 }
             }
             return
@@ -141,6 +147,25 @@ final class Transfer {
             }
             send(bytes) { self.uploadChunk(remaining - UInt64(count), recordInventory: recordInventory) }
         } catch { finish(false) }
+    }
+
+    private func readPackets(_ remaining: Int, recordInventory: @escaping (Data) -> Void) {
+        guard remaining > 0 else {
+            recordInventory(inventory)
+            finish(true)
+            return
+        }
+        read(4) { header in
+            let length = header.reduce(0) { ($0 << 8) | Int($1) }
+            guard length > 0, length <= maxPacket, self.inventory.count + length <= maxInventory else {
+                self.finish(false)
+                return
+            }
+            self.read(length) { packet in
+                self.inventory.append(packet)
+                self.readPackets(remaining - 1, recordInventory: recordInventory)
+            }
+        }
     }
 
     func download(to folder: URL, inventory: URL) {
@@ -171,10 +196,27 @@ final class Transfer {
     private func reply(with inventory: URL) {
         let data = (try? Data(contentsOf: inventory)) ?? Data("[]".utf8)
         guard !data.isEmpty, data.count <= maxInventory else { finish(false); return }
-        var reply = Data([1])
-        reply.append(withUnsafeBytes(of: UInt32(data.count).bigEndian) { Data($0) })
-        reply.append(data)
-        send(reply) { self.finish(true) }
+        // A single-packet inventory keeps the 0.5.0 reply, so those peers still sync.
+        if data.count <= maxPacket {
+            var reply = Data([1])
+            reply.append(withUnsafeBytes(of: UInt32(data.count).bigEndian) { Data($0) })
+            reply.append(data)
+            send(reply) { self.finish(true) }
+            return
+        }
+        let packets = stride(from: 0, to: data.count, by: maxPacket).map {
+            data.subdata(in: $0..<min($0 + maxPacket, data.count))
+        }
+        var header = Data([2])
+        header.append(withUnsafeBytes(of: UInt32(packets.count).bigEndian) { Data($0) })
+        send(header) { self.sendPackets(packets[...]) }
+    }
+
+    private func sendPackets(_ packets: ArraySlice<Data>) {
+        guard let packet = packets.first else { finish(true); return }
+        var framed = withUnsafeBytes(of: UInt32(packet.count).bigEndian) { Data($0) }
+        framed.append(packet)
+        send(framed) { self.sendPackets(packets.dropFirst()) }
     }
 
     private func downloadChunk(_ remaining: UInt64, to archive: URL, inventory: URL) {

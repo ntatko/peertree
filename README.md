@@ -117,10 +117,6 @@ Add `.peertree.json` to a protected branch, then publish the initial snapshot as
 {
   "version": 1,
   "protected_branches": ["main", "dev"],
-  "review": {
-    "required_approvals": 2,
-    "allow_self_approval": false
-  },
   "checks": {
     "lint": ["./ci/lint.sh"],
     "test": ["./ci/test.sh"]
@@ -133,7 +129,7 @@ peertree publish --branch main --branch dev --default main
 peertree policy show --base dev --json
 ```
 
-The last published target commit supplies the active policy. A branch can change this file through review. Its old policy continues to govern the merge, and signed checks and approvals count against the reviewed commit and policy. While the PeerTree service is running, committed checks run automatically for each revision you submit. Checks execute the submitted commit's code, so a teammate's revision waits until you review it and click **Run local pipeline**. Checks run on this Mac from a temporary checkout of the exact commit, and only results signed by someone other than the author count toward the policy. The Pipeline tab shows queued and running states and lets you rerun a check manually. A repository without a committed policy keeps the two-reviewer workflow and the manually run fallback pipeline command.
+The last published target commit supplies the active policy. A branch can change this file through review. Its old policy continues to govern the merge, and signed checks and approvals count against the reviewed commit and policy. While the PeerTree service is running, committed checks run automatically for each revision you submit. Checks execute the submitted commit's code, so a teammate's revision waits until you review it and click **Run local pipeline**. Checks run on this Mac from a temporary checkout of the exact commit, and only results signed by someone other than the author count toward the policy. The Pipeline tab shows queued and running states and lets you rerun a check manually. Merges need two teammate approvals in the integrator workflow and one in peer majority, with no outstanding change request, and authors can't approve their own branches. A repository without a committed policy uses the manually run fallback pipeline command.
 
 PeerTree's own policy protects `main` and requires one teammate approval plus the lint and test checks. Both run offline on a Mac with the Apple command-line tools, Rust with rustfmt and Clippy, and Node.js.
 

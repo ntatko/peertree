@@ -12,11 +12,12 @@ import subprocess
 import tempfile
 
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 SOURCE = Path(__file__).resolve().parent
 ICON = "desktop/frontend/peertree-icon.png"
 RESOURCES = (
-    "app.py", "agent.py", "lan.py", "peer.py", "quorum.py", "app.js", "index.html", "style.css", ICON,
+    "app.py", "agent.py", "lan.py", "peer.py", "quorum.py", "app.js", "index.html", "style.css",
+    "assets/peertree-mark.png",
     "assets/seti/theme.json", "assets/seti/seti.woff", "assets/seti/LICENSE.txt",
     "assets/marked/marked.umd.js", "assets/marked/LICENSE.md",
 )

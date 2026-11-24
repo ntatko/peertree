@@ -1,10 +1,6 @@
 {
   "version": 1,
   "protected_branches": ["main"],
-  "review": {
-    "required_approvals": 1,
-    "allow_self_approval": false
-  },
   "checks": {
     "lint": ["python3", "ci/checks.py", "lint"],
     "test": ["python3", "ci/checks.py", "test"]

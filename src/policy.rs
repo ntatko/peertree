@@ -30,7 +30,6 @@ fn branch_name(branch: &str) -> bool {
 
 pub struct Policy {
     branches: BTreeSet<String>,
-    required: usize,
     checks: BTreeMap<String, Vec<String>>,
 }
 
@@ -54,17 +53,17 @@ impl Policy {
         if branches.is_empty() {
             return Err("List at least one protected branch.".into());
         }
-        let review = property(config, "review")?.object()?;
-        fields(review, &["required_approvals", "allow_self_approval"])?;
-        let required = property(review, "required_approvals")?.unsigned()?;
-        if !(1..=20).contains(&required) {
-            return Err("Required approvals must be between 1 and 20.".into());
-        }
-        if !matches!(
-            review.get("allow_self_approval"),
-            None | Some(Value::Bool(false))
-        ) {
-            return Err("PeerTree policy version 1 requires independent reviewers.".into());
+        // Policies committed before 0.5.1 carry a review section. It is still accepted so
+        // those branches stay mergeable, but the team mode now sets the approval count.
+        if let Some(review) = config.get("review") {
+            let review = review.object()?;
+            fields(review, &["required_approvals", "allow_self_approval"])?;
+            if !matches!(
+                review.get("allow_self_approval"),
+                None | Some(Value::Bool(false))
+            ) {
+                return Err("PeerTree requires independent reviewers.".into());
+            }
         }
         let mut checks = BTreeMap::new();
         let configured = property(config, "checks")?.object()?;
@@ -95,11 +94,7 @@ impl Policy {
             }
             checks.insert(name.clone(), args);
         }
-        Ok(Self {
-            branches,
-            required,
-            checks,
-        })
+        Ok(Self { branches, checks })
     }
 
     pub fn evaluate(&self, context: &BTreeMap<String, Value>) -> Result<Value, String> {
@@ -110,6 +105,7 @@ impl Policy {
             ));
         }
         let author = property(context, "author")?.string()?;
+        let required = property(context, "required")?.unsigned()?;
         let mut votes = BTreeMap::new();
         for item in property(context, "reviews")?.array()? {
             let review = item.object()?;
@@ -134,10 +130,10 @@ impl Policy {
             .filter(|check| !passes.contains(check.as_str()))
             .map(|check| Value::String(check.clone()))
             .collect::<Vec<_>>();
-        let ready = approvals >= self.required && !blocked && missing.is_empty();
+        let ready = approvals >= required && !blocked && missing.is_empty();
         Ok(Value::Object(BTreeMap::from([
             ("approvals".into(), Value::Number(approvals.to_string())),
-            ("required".into(), Value::Number(self.required.to_string())),
+            ("required".into(), Value::Number(required.to_string())),
             ("blocked".into(), Value::Bool(blocked)),
             ("missing".into(), Value::Array(missing)),
             ("ready".into(), Value::Bool(ready)),
@@ -165,8 +161,8 @@ mod tests {
     fn approvals_from_distinct_peers_and_required_checks_gate_the_merge() {
         let input = parse(
             r#"{
-          "operation":"evaluate","target":"dev","author":"author",
-          "policy":{"version":1,"protected_branches":["dev"],"review":{"required_approvals":2},
+          "operation":"evaluate","target":"dev","author":"author","required":2,
+          "policy":{"version":1,"protected_branches":["dev"],
                     "checks":{"lint":["./lint.sh"],"test":["./test.sh"]}},
           "reviews":[{"who":"author","vote":"approve"},{"who":"one","vote":"approve"},
                      {"who":"two","vote":"approve"}],

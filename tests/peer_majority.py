@@ -65,7 +65,7 @@ def run_test(folder):
     c.mkdir()
     git(a, "init", "-qb", "main")
     (a / ".peertree.json").write_text(
-        '{"version":1,"protected_branches":["main"],"review":{"required_approvals":2},'
+        '{"version":1,"protected_branches":["main"],'
         '"checks":{"test":["/bin/sh","-c","test -f .peertree.json"]}}\n'
     )
     git(a, "add", ".")

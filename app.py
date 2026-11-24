@@ -32,6 +32,8 @@ from quorum import Ballots, QUORUM_RECORDS
 BRANCHES = ("dev", "main")
 NAMESPACE = "neighbor-review-v1"
 MAX_EXCHANGE = 512 * 1024 * 1024
+MAX_RECORDS = 2 * 1024 * 1024
+DEPENDENT_KINDS = ("review", "comment", "check")
 MAX_IMAGE_PREVIEW = 16 * 1024 * 1024
 IMAGE_TYPES = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
@@ -732,10 +734,10 @@ class Workspace:
 
     def merge_gate(self, ident, proposal, policy):
         reviews = self.reviews(ident, policy[0] if policy else None)
+        # Peer majority needs one approval from the other two peers; the integrator workflow needs both.
+        required = 1 if self.data_state.get("quorum") else 2
         if policy:
             policy_id, config = policy
-            if self.data_state.get("quorum"):
-                config = {**config, "review": {**config["review"], "required_approvals": 1}}
             newest = {}
             for key, item in self.records.items():
                 record = item["record"]
@@ -750,14 +752,13 @@ class Workspace:
             passed = sorted({check for (_, check), result in newest.items() if result[2]})
             gate = rust_policy(encoded({"operation": "evaluate", "policy": config,
                                         "target": proposal["target"], "author": proposal["who"],
-                                        "reviews": reviews, "passed": passed}))
+                                        "required": required, "reviews": reviews, "passed": passed}))
             return {**gate, "check_runs": [
                 {"who": who, "check": check, "passed": result[2], "at": result[0]}
                 for (who, check), result in sorted(newest.items())
             ]}
         approvals = sum(item["vote"] == "approve" for item in reviews)
         blocked = any(item["vote"] == "changes" for item in reviews)
-        required = 1 if self.data_state.get("quorum") else 2
         return {"approvals": approvals, "required": required, "blocked": blocked, "missing": [],
                 "ready": approvals >= required and not blocked}
 
@@ -1479,29 +1480,50 @@ class Workspace:
             path.unlink(missing_ok=True)
         return {"message": "Cleared cached peer helpers." if helpers else "There are no unused peer helpers to clear."}
 
-    def inventory_plan(self, remote):
-        return rust_request("__inventory", encoded({"local": list(self.records), "remote": remote}))
+    def inventory_plan(self, remote, local=None):
+        local = list(self.records) if local is None else local
+        return rust_request("__inventory", encoded({"local": local, "remote": remote}))
 
     def export(self, plan=None):
-        selected = [self.records[ident] for ident in plan["missing"]] if plan else list(self.records.values())
-        metadata = encoded(selected)
-        if len(metadata) > 2 * 1024 * 1024:
-            raise Problem("The signed exchange records exceed 2 MB.")
+        with self.lock:
+            parts = self.export_records(plan)
+        return self.export_archive(*parts)
+
+    def export_records(self, plan=None):
+        """Choose an exchange's records and Git refs. This is quick enough to run under the lock."""
+        if not plan:
+            selected = list(self.records.values())
+            metadata = encoded(selected)
+            if len(metadata) > MAX_RECORDS:
+                raise Problem("The signed exchange records exceed 2 MB.")
+            return metadata, None, None
+        # A teammate who is far behind catches up over several exchanges. Submissions go
+        # before the reviews, comments, and checks that reference them, so every packet
+        # imports on its own and the next one follows once the teammate's inventory updates.
+        missing = sorted((self.records[ident] for ident in plan["missing"]),
+                         key=lambda item: (item["record"]["kind"] in DEPENDENT_KINDS, item["record"]["at"]))
+        selected, size = [], 2
+        for item in missing:
+            size += len(encoded(item)) + 1
+            if selected and size > MAX_RECORDS:
+                break
+            selected.append(item)
+        wanted, tags = referenced_objects([item["record"] for item in selected])
+        known, known_tags = referenced_objects([self.records[ident]["record"] for ident in plan["common"]])
+        return encoded(selected), (wanted | tags) - (known | known_tags), known | known_tags
+
+    def export_archive(self, metadata, refs, known):
+        """Bundle the Git objects for chosen records. Runs without the lock; Git allows concurrent reads."""
         with tempfile.TemporaryDirectory() as tmp:
             bundle = Path(tmp) / "objects.bundle"
-            if plan:
-                wanted, tags = referenced_objects([item["record"] for item in selected])
-                known, known_tags = referenced_objects([self.records[ident]["record"] for ident in plan["common"]])
-                known |= known_tags
-                refs = (wanted | tags) - known
-                if refs:
-                    spec = "".join(f"refs/neighbor-review/objects/{oid}\n" for oid in sorted(refs))
-                    spec += "".join(f"^{oid}\n" for oid in sorted(known))
-                    if self.git_bytes("rev-list", "--objects", "--stdin", data=spec.encode()):
-                        self.git("bundle", "create", str(bundle), "--stdin", data=spec.encode())
-            elif self.git("for-each-ref", "refs/neighbor-review/objects/").strip():
+            if refs:
+                spec = "".join(f"refs/neighbor-review/objects/{oid}\n" for oid in sorted(refs))
+                spec += "".join(f"^{oid}\n" for oid in sorted(known))
+                if self.git_bytes("rev-list", "--objects", "--stdin", data=spec.encode()):
+                    self.git("bundle", "create", str(bundle), "--stdin", data=spec.encode())
+            elif refs is None and self.git("for-each-ref", "refs/neighbor-review/objects/").strip():
                 self.git("bundle", "create", str(bundle), "--glob=refs/neighbor-review/objects/*")
-            if bundle.exists() and bundle.stat().st_size > MAX_EXCHANGE - 2 * 1024 * 1024:
+            if bundle.exists() and bundle.stat().st_size > MAX_EXCHANGE - MAX_RECORDS:
                 raise Problem("The Git bundle exceeds the 512 MB exchange limit.")
             memory = io.BytesIO()
             with zipfile.ZipFile(memory, "w") as out:
@@ -1532,7 +1554,7 @@ class Workspace:
                 if ("records.json" not in names or len(names) != len(set(names))
                         or set(names) - {"records.json", "objects.bundle"}
                         or sum(item.file_size for item in archive.infolist()) > MAX_EXCHANGE
-                        or archive.getinfo("records.json").file_size > 2 * 1024 * 1024):
+                        or archive.getinfo("records.json").file_size > MAX_RECORDS):
                     raise Problem("Invalid or oversized exchange.")
                 records = json.loads(archive.read("records.json"))
                 if not isinstance(records, list):
@@ -1667,11 +1689,16 @@ class Workspace:
 
 def handle(workspace, token):
     class Handler(BaseHTTPRequestHandler):
-        def send(self, status, data, mime="application/json; charset=utf-8", attachment=None):
+        def send(self, status, data, mime="application/json; charset=utf-8", attachment=None, etag=None):
             self.send_response(status)
             self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
+            if status != 304:
+                self.send_header("Content-Length", str(len(data)))
+            if etag:
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("ETag", etag)
+            else:
+                self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy",
                              "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'")
@@ -1691,7 +1718,7 @@ def handle(workspace, token):
                     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
                     "/style.css": ("style.css", "text/css; charset=utf-8"),
                     "/assets/marked/marked.umd.js": ("assets/marked/marked.umd.js", "text/javascript; charset=utf-8"),
-                    "/peertree-icon.png": ("desktop/frontend/peertree-icon.png", "image/png"),
+                    "/assets/peertree-mark.png": ("assets/peertree-mark.png", "image/png"),
                     "/assets/seti/theme.json": ("assets/seti/theme.json", "application/json; charset=utf-8"),
                     "/assets/seti/seti.woff": ("assets/seti/seti.woff", "font/woff"),
                 }
@@ -1699,8 +1726,15 @@ def handle(workspace, token):
                     name, mime = assets[path]
                     content = (ASSETS / name).read_bytes()
                     if path == "/":
+                        # The page carries this session's token, so it is never cached.
                         content = content.replace(b"__SESSION_TOKEN__", html.escape(token).encode())
-                    self.send(200, content, mime)
+                        self.send(200, content, mime)
+                        return
+                    etag = '"' + hashlib.sha256(content).hexdigest()[:32] + '"'
+                    if etag in (self.headers.get("If-None-Match") or "").replace(" ", "").split(","):
+                        self.send(304, b"", mime, etag=etag)
+                        return
+                    self.send(200, content, mime, etag=etag)
                     return
             if not secrets.compare_digest(self.headers.get("X-Neighbor-Token", ""), token):
                 self.send(403, encoded({"error": "Open the app's local page to use its API."}))

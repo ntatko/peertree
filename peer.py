@@ -15,7 +15,8 @@ import zipfile
 
 
 PEER_CODE = "NR1."
-MAX_INVENTORY = 512 * 1024
+# The helper sends inventories in 512 KB packets; 64 MB holds about 1M record IDs.
+MAX_INVENTORY = 64 * 1024 * 1024
 ASSETS = Path(__file__).resolve().parent
 
 
@@ -194,23 +195,25 @@ class PeerSession:
                         self.error = f"Could not import a nearby exchange. {error}"
                     finally:
                         path.unlink(missing_ok=True)
-                inventory = json.dumps(sorted(self.workspace.records), separators=(",", ":")).encode()
-                if len(inventory) > MAX_INVENTORY:
-                    raise RuntimeError("The nearby signed record inventory exceeds 512 KB.")
-                if inventory != previous_inventory:
-                    write_atomic(directory / "inventory.json", inventory)
-                    previous_inventory = inventory
-                exports = self.prepare_exports(directory, allowed, inventory, plans)
-                if exports != previous_exports:
-                    write_atomic(directory / "exports.json", json.dumps(exports, sort_keys=True).encode())
-                    active = set(exports.values())
-                    for old in (directory / "outgoing").glob("*.zip"):
-                        if old.name not in active:
-                            old.unlink(missing_ok=True)
-                    previous_exports = exports
+                local = sorted(self.workspace.records)
+            inventory = json.dumps(local, separators=(",", ":")).encode()
+            if len(inventory) > MAX_INVENTORY:
+                self.error = "The nearby signed record inventory exceeds 64 MB."
+            elif inventory != previous_inventory:
+                write_atomic(directory / "inventory.json", inventory)
+                previous_inventory = inventory
+            # Building Git bundles can take a while, so it runs without the workspace lock.
+            exports = self.prepare_exports(directory, allowed, inventory, local, plans)
+            if exports != previous_exports:
+                write_atomic(directory / "exports.json", json.dumps(exports, sort_keys=True).encode())
+                active = set(exports.values())
+                for old in (directory / "outgoing").glob("*.zip"):
+                    if old.name not in active:
+                        old.unlink(missing_ok=True)
+                previous_exports = exports
             self.stopped.wait(1)
 
-    def prepare_exports(self, directory, peers, inventory, plans):
+    def prepare_exports(self, directory, peers, inventory, local, plans):
         exports = {}
         local = hashlib.sha256(inventory).digest()
         for peer in tuple(plans):
@@ -233,15 +236,17 @@ class PeerSession:
                     exports[peer] = cached[1]
                 continue
             try:
-                plan = self.workspace.inventory_plan(json.loads(remote))
+                plan = self.workspace.inventory_plan(json.loads(remote), local)
                 if not plan["missing"]:
                     plans[peer] = (generation, None, 0)
                     continue
+                with self.workspace.lock:
+                    parts = self.workspace.export_records(plan)
                 archive = f"{peer}-{generation}.zip"
-                write_atomic(directory / "outgoing" / archive, self.workspace.export(plan))
+                write_atomic(directory / "outgoing" / archive, self.workspace.export_archive(*parts))
                 exports[peer] = archive
                 plans[peer] = (generation, archive, 0)
-            except (OSError, ValueError, RuntimeError) as error:
+            except (OSError, ValueError, RuntimeError, KeyError) as error:
                 self.error = f"Could not prepare the nearby exchange. {error}"
                 plans[peer] = (generation, None, time.monotonic() + 5)
         return exports
