@@ -2,10 +2,12 @@
 
 import base64
 import hashlib
+import hmac
 import json
 from pathlib import Path
 import platform
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -80,6 +82,11 @@ class PeerSession:
         self.code = ""
         self.directory = None
         self.helper = None
+        self.hosting_until = 0
+        self.code_attempts = 0
+        self.pairing_result = None
+        self.display = None
+        self.imported = []
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self.run, name="nearby-wifi", daemon=True)
 
@@ -97,6 +104,93 @@ class PeerSession:
             return False
         write_atomic(self.directory / "sync.json", json.dumps(str(time.monotonic_ns())).encode())
         return True
+
+    def read_json(self, name):
+        try:
+            return json.loads((self.directory / name).read_bytes())
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def host_open(self):
+        """Keep listing Macs that are waiting to join while the host's pairing window stays open."""
+        self.hosting_until = time.monotonic() + 15
+        write_atomic(self.directory / "host.json", b'{"active":true}')
+        return {"message": "Looking for Macs waiting to join."}
+
+    def pair_start(self, ident):
+        if not isinstance(ident, str) or not re.fullmatch("[0-9a-f]{32}", ident):
+            raise ValueError("Choose a Mac that is waiting to join.")
+        self.code_attempts = 0
+        self.pairing_result = None
+        write_atomic(self.directory / "pair-start.json",
+                     json.dumps({"id": ident, "nonce": secrets.token_hex(8)}).encode())
+        return {"message": "Connecting to the other Mac."}
+
+    def pair_confirm(self, code):
+        status = self.read_json("pairing.json") or {}
+        if status.get("state") != "verify":
+            raise ValueError("There is no pairing code to confirm right now.")
+        if status.get("role") == "join":
+            entered = "".join(str(code or "").split())
+            if not hmac.compare_digest(entered, status.get("code", "")):
+                self.code_attempts += 1
+                if self.code_attempts >= 3:
+                    self.pair_cancel()
+                    raise ValueError("The code didn't match three times, so pairing stopped. Start again on the host.")
+                raise ValueError("That code doesn't match. Check the host's screen and try again.")
+        with self.workspace.lock:
+            offer = self.workspace.pairing_offer(status["role"])
+        write_atomic(self.directory / "pair-confirm.json",
+                     json.dumps({"session": status["session"], "offer": offer}).encode())
+        return {"message": "Confirmed on this Mac."}
+
+    def pair_cancel(self):
+        status = self.read_json("pairing.json") or {}
+        if status.get("session"):
+            write_atomic(self.directory / "pair-cancel.json", json.dumps({"session": status["session"]}).encode())
+        return {"message": "Pairing cancelled."}
+
+    def pairing_status(self):
+        if self.directory is None:
+            return {"available": False}
+        hosting = time.monotonic() < self.hosting_until
+        session = self.read_json("pairing.json") or {}
+        if session.get("role") == "join":
+            # The person joining types the host's code, so this Mac never displays it.
+            session = {key: value for key, value in session.items() if key != "code"}
+        return {"available": True, "hosting": hosting, "session": session, "result": self.pairing_result,
+                "display": self.display_name(),
+                "requests": (self.read_json("requests.json") or []) if hosting else []}
+
+    def update_pairing(self, directory):
+        join_file = directory / "join.json"
+        if self.workspace.data_state.get("joining"):
+            if not join_file.exists():
+                write_atomic(join_file, json.dumps({"name": self.display_name()}).encode())
+        else:
+            join_file.unlink(missing_ok=True)
+        if time.monotonic() >= self.hosting_until:
+            (directory / "host.json").unlink(missing_ok=True)
+        result_file = directory / "pair-result.json"
+        if result_file.exists():
+            try:
+                result = json.loads(result_file.read_bytes())
+                result_file.unlink()
+                with self.workspace.lock:
+                    self.pairing_result = self.workspace.apply_pairing(result)
+            except (OSError, ValueError, RuntimeError) as error:
+                self.pairing_result = {"error": f"Pairing did not finish. {error}"}
+
+    def display_name(self):
+        if self.display:
+            return self.display
+        name = self.workspace.data_state["name"]
+        try:
+            computer = self.execute(["/usr/sbin/scutil", "--get", "ComputerName"]).decode().strip()
+        except (OSError, RuntimeError):
+            computer = ""
+        self.display = f"{name} · {computer}"[:80] if computer and computer != name else name
+        return self.display
 
     def executable(self):
         bundled = ASSETS.parent / "Helpers" / "peertree-peer"
@@ -178,6 +272,7 @@ class PeerSession:
             if child.poll() is not None:
                 log = (directory / "native.log").read_text(errors="replace").strip()
                 raise RuntimeError(log[-1000:] or "The nearby Wi-Fi helper stopped.")
+            self.update_pairing(directory)
             with self.workspace.lock:
                 peers = self.workspace.data_state["peers"]
                 allowed = {ident[:32]: record["pin"] for ident, record in peers.items()
@@ -186,19 +281,26 @@ class PeerSession:
                 if serialized != previous_peers:
                     write_atomic(directory / "peers.json", serialized)
                     previous_peers = serialized
-                for path in sorted((directory / "incoming").glob("*.zip")):
-                    try:
-                        result = self.workspace.import_exchange(path.read_bytes())
-                        if result["imported"]:
-                            self.received = result["message"]
-                            self.received_count += 1
-                            self.received_at = time.time()
-                            self.received_activity = result["activity"]
-                        self.error = ""
-                    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
-                        self.error = f"Could not import a nearby exchange. {error}"
-                    finally:
-                        path.unlink(missing_ok=True)
+            # Imports verify signatures without the lock and take it only to store records.
+            for path in sorted((directory / "incoming").glob("*.zip")):
+                try:
+                    payload = path.read_bytes()
+                    digest = hashlib.sha256(payload).digest()
+                    if digest in self.imported:
+                        continue  # A teammate repeats a batch until it hears that it arrived.
+                    result = self.workspace.import_exchange(payload)
+                    self.imported = [*self.imported[-63:], digest]
+                    if result["imported"]:
+                        self.received = result["message"]
+                        self.received_count += 1
+                        self.received_at = time.time()
+                        self.received_activity = result["activity"]
+                    self.error = ""
+                except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
+                    self.error = f"Could not import a nearby exchange. {error}"
+                finally:
+                    path.unlink(missing_ok=True)
+            with self.workspace.lock:
                 local = sorted(self.workspace.records)
             inventory = json.dumps(local, separators=(",", ":")).encode()
             if len(inventory) > MAX_INVENTORY:

@@ -123,7 +123,6 @@ async function checkNearby() {
     const { enabled, error, notices, peer, version } = await api("nearby");
     const previousPeer = nearbyPeer;
     nearbyPeer = peer;
-    updatePairingCode();
     renderPeerPresence();
     desktopAlerts.hidden = (!enabled && !peer.enabled) || typeof Notification === "undefined" || Notification.permission !== "default";
     const status = byId("nearby-status");
@@ -301,6 +300,8 @@ function render() {
     else item.removeAttribute("aria-current");
   }
   byId("worktree-picker").hidden = state.bootstrap;
+  // A Mac waiting to join has nobody to add or sync with until pairing finishes.
+  byId("team-open").hidden = byId("refresh").hidden = !!(state.joining || state.staging);
   const select = byId("worktree");
   options(select, state.worktrees.map(({ path, branch }) =>
     [path, (branch || "detached HEAD") + (state.worktrees.length > 1 ? " · " + path.split("/").at(-1) : "")]), state.repo);
@@ -1036,7 +1037,7 @@ function renderPeerPresence() {
     cards.push(card);
   }
   const pair = button("", openTeam, "pair-card");
-  pair.append(element("strong", "＋  Pair a nearby Mac"), element("span", "Exchange verified pairing codes in person.", "help"));
+  pair.append(element("strong", "＋  Add a teammate"), element("span", "Pair a nearby Mac that's waiting to join.", "help"));
   byId("peer-mini").replaceChildren(...mini);
   const grid = byId("peer-cards");
   if (!grid.contains(document.activeElement)) grid.replaceChildren(...cards, pair);
@@ -1126,7 +1127,32 @@ function reviewBlockers(proposal) {
 function renderClone() {
   const { integrator, snapshot } = state;
   const checkout = byId("clone-checkout");
-  checkout.hidden = !snapshot;
+  const joinFlow = state.joining || state.staging;
+  for (const id of ["clone-pair", "clone-settings", "clone-import"]) byId(id).hidden = joinFlow;
+  byId("join-code-form").hidden = true;
+  byId("clone-folder").hidden = !state.staging || state.joining;
+  checkout.hidden = !snapshot || state.staging;
+  if (joinFlow && !pairingTimer) pollPairing();
+  if (state.joining) {
+    const session = pairing?.session || {};
+    const active = session.role === "join" ? session.state : "";
+    byId("join-code-form").hidden = active !== "verify";
+    byId("clone-title").textContent = active === "verify" ? "Enter the code from the host"
+      : active === "waiting" ? "Code accepted" : "Waiting for a teammate";
+    byId("clone-status").textContent = active === "verify"
+      ? "Type the six-digit code shown on the host Mac."
+      : active === "waiting" ? "Waiting for the host to confirm…"
+        : active === "connecting" ? "A teammate is connecting…"
+          : (active === "failed" ? session.error + " " : "") + "On the host Mac, choose Add a teammate and select " +
+            (pairing?.display ? "“" + pairing.display + "”" : "this Mac") + ".";
+    return;
+  }
+  if (state.staging) {
+    byId("clone-title").textContent = "Joined " + state.project;
+    byId("clone-status").textContent = (snapshot ? "The repository has arrived. " : "Receiving " + state.project +
+      " from " + name(integrator) + "… ") + "Choose where it should live on this Mac.";
+    return;
+  }
   if (state.quorum && snapshot) {
     byId("clone-title").textContent = "Peer snapshot ready";
     byId("clone-status").textContent = "PeerTree will check out " + snapshot.default + " at the latest agreed tip in " + state.repo + ".";
@@ -1658,26 +1684,6 @@ function setupTeam() {
   options(byId("integrator"), eligible, state.integrator, "Choose an integrator");
   byId("reset-pairing-form").hidden = state.paired.length === 0;
   options(byId("reset-pairing"), state.paired.map(id => [id, name(id)]));
-  updatePairingCode();
-}
-
-function updatePairingCode() {
-  byId("peer-invite").hidden = !nearbyPeer?.code;
-  byId("pair-help").textContent = nearbyPeer?.code ? "Verify and exchange codes on both Macs in person."
-    : "Verify public keys in person for manual exchanges. Start PeerTree with nearby Wi-Fi enabled to get a pairing code.";
-  const invite = byId("peer-code");
-  if (nearbyPeer?.code && invite.value !== nearbyPeer.code) invite.value = nearbyPeer.code;
-  const code = byId("settings-pair-code");
-  const value = nearbyPeer?.code || "";
-  if (code.value !== value) {
-    code.value = value;
-    byId("settings-copy-status").hidden = true;
-  }
-  byId("settings-copy-code").disabled = !value;
-  byId("settings-pair-help").textContent = value
-    ? "Contains your public signing key and certificate fingerprint. Verify codes with your teammate in person."
-    : nearbyPeer?.starting ? "Starting nearby Wi-Fi…"
-      : "Open PeerTree with nearby Wi-Fi enabled to generate a pairing code.";
 }
 
 function updatePipelineSave() {
@@ -1695,9 +1701,100 @@ function openTeam() {
   if (!state) return;
   setupTeam();
   byId("key-status").textContent = "";
-  byId("peer-code-status").textContent = "";
+  pairingShown = "";
+  renderPairing(null);
   byId("team-dialog").showModal();
+  pollPairing();
 }
+
+// Pairing: the host lists Macs waiting to join and both screens show one code. The joining
+// Mac types it and the host confirms, so a device in between can't pair itself with either.
+let pairingTimer;
+let pairing;
+let pairingShown = "";
+
+function pairingWanted() {
+  return byId("team-dialog").open || !!(state?.joining || state?.staging);
+}
+
+async function pollPairing() {
+  clearTimeout(pairingTimer);
+  if (!state || !pairingWanted()) return;
+  try {
+    if (byId("team-dialog").open) await api("pairing", { action: "host" });
+    const previous = pairing;
+    pairing = await api("pairing");
+    const result = pairing.result;
+    const key = result ? (result.error || result.message) : "";
+    if (key && key !== pairingShown && previous) {
+      pairingShown = key;
+      notify(key, !!result.error);
+      if (!result.error) await refresh();
+    }
+    renderPairing(pairing);
+    if (view === "clone") renderClone();
+  } catch (error) {
+    renderPairing({ available: false, error: error.message });
+  }
+  pairingTimer = setTimeout(pollPairing, 1000);
+}
+
+function renderPairing(status) {
+  const session = status?.session || {};
+  const hosting = session.role === "host" && ["connecting", "verify", "waiting"].includes(session.state);
+  const list = byId("pair-requests");
+  const requests = status?.requests || [];
+  list.replaceChildren(...requests.map(request => {
+    const item = element("li");
+    item.append(button(request.name, () => pairAction({ action: "start", id: request.id }), "pair-request"));
+    return item;
+  }));
+  list.hidden = hosting || !requests.length;
+  byId("pair-help").hidden = hosting;
+  byId("pair-verify").hidden = !(hosting && session.state !== "connecting");
+  byId("pair-peer").textContent = session.peer || "the other Mac";
+  byId("pair-code").textContent = session.code ? session.code.slice(0, 3) + " " + session.code.slice(3) : "";
+  byId("pair-confirm").disabled = session.state !== "verify";
+  let message = "";
+  if (status && !status.available) message = status.error || "Turn on nearby Wi-Fi to pair Macs nearby.";
+  else if (hosting && session.state === "connecting") message = "Connecting to " + (session.peer || "the other Mac") + "…";
+  else if (hosting && session.state === "waiting") message = "Confirmed here. Waiting for the other Mac…";
+  else if (session.role === "host" && session.state === "failed") message = session.error;
+  else if (session.role === "host" && session.state === "paired") message = status.result?.error || status.result?.message || "";
+  else if (status && !requests.length) message = "Looking for Macs waiting to join…";
+  byId("pair-state").textContent = message;
+}
+
+async function pairAction(input) {
+  try {
+    await api("pairing", input);
+  } catch (error) {
+    notify(error.message, true);
+  }
+  pollPairing();
+}
+
+byId("team-dialog").addEventListener("close", () => {
+  if (pairing?.session?.role === "host" && ["connecting", "verify", "waiting"].includes(pairing.session.state)) {
+    api("pairing", { action: "cancel" }).catch(() => {});
+  }
+});
+byId("pair-confirm").addEventListener("click", () => pairAction({ action: "confirm" }));
+byId("pair-cancel").addEventListener("click", () => pairAction({ action: "cancel" }));
+byId("join-code-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const field = byId("join-code");
+  try {
+    await api("pairing", { action: "confirm", code: field.value });
+    field.value = "";
+  } catch (error) {
+    notify(error.message, true);
+    field.select();
+  }
+  pollPairing();
+});
+byId("join-cancel").addEventListener("click", () => pairAction({ action: "cancel" }));
+byId("clone-folder").addEventListener("click", () => change("destination", {}, null, "Choose a folder in the dialog…"));
 byId("team-open").addEventListener("click", openTeam);
 byId("quorum-snapshot").addEventListener("change", updateQuorumSnapshot);
 byId("quorum-init").addEventListener("click", () => change("team", { action: "quorum-init" }));
@@ -1718,8 +1815,6 @@ async function copyFrom(field, status, successMessage) {
     byId(status).textContent = "Press Command-C to copy the selected text.";
   }
 }
-byId("settings-copy-code").addEventListener("click", () =>
-  copyFrom("settings-pair-code", "settings-copy-status", "Pairing code copied."));
 byId("check-command").addEventListener("input", updatePipelineSave);
 byId("prune-cache").addEventListener("click", () => change("prune-cache", {}));
 for (const toggle of document.querySelectorAll("[data-notification]")) {
@@ -1732,8 +1827,6 @@ for (const toggle of document.querySelectorAll("[data-notification]")) {
   });
 }
 byId("copy-key").addEventListener("click", () => copyFrom("public-key", "key-status", "Public key copied."));
-byId("copy-peer-code").addEventListener("click", () =>
-  copyFrom("peer-code", "peer-code-status", "Pairing code copied."));
 function openSubmission(source) {
   return perform(async () => {
     await refresh();
@@ -1888,7 +1981,7 @@ function renderCommands() {
   const available = Object.entries(views).filter(([screen]) => state.bootstrap
     ? ["peers", "settings", "clone"].includes(screen) : screen !== "clone");
   const commands = available.map(([screen, label]) => [label, () => navigate(screen)]);
-  commands.push(["Pair a Mac", openTeam], ["Sync now", () => byId("refresh").click()],
+  commands.push(["Add a teammate", openTeam], ["Sync now", () => byId("refresh").click()],
     ["Import exchange", () => byId("import").click()], ["Export exchange", () => byId("export").click()]);
   if (!state.bootstrap) commands.push(["Submit branch for review", () => openSubmission()]);
   const results = commands.filter(([label]) => label.toLowerCase().includes(filter)).map(([label, action]) =>

@@ -241,12 +241,418 @@ final class Transfer {
     }
 }
 
+private let joinServiceType = "_peertree-join._tcp"
+private let maxPairingFrame = 256 * 1024
+
+private func hex(_ bytes: some Sequence<UInt8>) -> String {
+    bytes.map { String(format: "%02x", $0) }.joined()
+}
+
+private func randomBytes(_ count: Int) -> Data {
+    var bytes = Data(count: count)
+    _ = bytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, count, $0.baseAddress!) }
+    return bytes
+}
+
+private func peerPin(_ connection: NWConnection) -> String? {
+    guard let metadata = connection.metadata(definition: NWProtocolTLS.definition) as? NWProtocolTLS.Metadata
+    else { return nil }
+    var leaf: SecCertificate?
+    _ = sec_protocol_metadata_access_peer_certificate_chain(metadata.securityProtocolMetadata) { certificate in
+        if leaf == nil { leaf = sec_certificate_copy_ref(certificate).takeRetainedValue() }
+    }
+    return leaf.map(certificatePin)
+}
+
+private func ownPin(_ identity: sec_identity_t) -> String {
+    guard let local = sec_identity_copy_ref(identity)?.takeRetainedValue() else { return "" }
+    var certificate: SecCertificate?
+    guard SecIdentityCopyCertificate(local, &certificate) == errSecSuccess, let certificate else { return "" }
+    return certificatePin(certificate)
+}
+
+// TLS between unpaired Macs encrypts the channel but proves nothing about who is on the
+// other end. Both people check a six-digit code instead: it covers both certificates and a
+// random value from each side, and the joining Mac commits to its value first, so a device in
+// the middle cannot steer both connections to the same code.
+final class PairingSession {
+    let id = UUID().uuidString
+    let role: String
+    private let connection: NWConnection
+    private let queue: DispatchQueue
+    private let localPin: String
+    private let report: (PairingSession) -> Void
+    private let ended: (PairingSession) -> Void
+    private let nonce = randomBytes(32)
+    private var commitment: Data?
+    private var buffer = Data()
+    private var localOffer: Any?
+    private var remoteOffer: Any?
+    private var finished = false
+    private(set) var state = "connecting"
+    private(set) var code = ""
+    private(set) var remotePin = ""
+    private(set) var error = ""
+    let peerName: String
+
+    init(role: String, connection: NWConnection, peerName: String, localPin: String, queue: DispatchQueue,
+         report: @escaping (PairingSession) -> Void, ended: @escaping (PairingSession) -> Void) {
+        self.role = role
+        self.connection = connection
+        self.peerName = peerName
+        self.localPin = localPin
+        self.queue = queue
+        self.report = report
+        self.ended = ended
+    }
+
+    var status: [String: Any] {
+        ["session": id, "role": role, "state": state, "code": code, "peer": peerName, "error": error]
+    }
+
+    var result: [String: Any]? {
+        guard state == "paired", let remoteOffer else { return nil }
+        return ["session": id, "role": role, "pin": remotePin, "offer": remoteOffer]
+    }
+
+    func start() {
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready: self.ready()
+            case .failed(let error): self.fail("The connection failed. \(error.localizedDescription)")
+            case .cancelled: self.fail("The other Mac closed the connection.")
+            default: break
+            }
+        }
+        queue.asyncAfter(deadline: .now() + .seconds(300)) { [weak self] in
+            self?.fail("Pairing timed out. Start again from the host.")
+        }
+        connection.start(queue: queue)
+    }
+
+    private func ready() {
+        guard let pin = peerPin(connection), pin.count == 64 else {
+            fail("The other Mac did not present a certificate.")
+            return
+        }
+        remotePin = pin
+        if role == "join" {
+            send(["commit": hex(digest("commit", nonce))])
+        }
+        receive()
+    }
+
+    private var hostPin: String { role == "host" ? localPin : remotePin }
+    private var joinPin: String { role == "join" ? localPin : remotePin }
+
+    private func digest(_ label: String, _ parts: Data...) -> Data {
+        var hasher = SHA256()
+        hasher.update(data: Data("peertree-pair-\(label)\0\(hostPin)\0\(joinPin)\0".utf8))
+        for part in parts { hasher.update(data: part) }
+        return Data(hasher.finalize())
+    }
+
+    private func showCode(hostNonce: Data, joinNonce: Data) {
+        let value = digest("code", hostNonce, joinNonce).prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        code = String(format: "%06llu", value % 1_000_000)
+        state = "verify"
+        report(self)
+    }
+
+    func confirm(_ offer: Any) {
+        guard state == "verify", localOffer == nil else { return }
+        localOffer = offer
+        state = "waiting"
+        send(["confirm": offer])
+        complete()
+    }
+
+    func cancel(_ reason: String) {
+        guard !finished else { return }
+        send(["cancel": reason])
+        fail(reason)
+    }
+
+    private func complete() {
+        guard localOffer != nil, remoteOffer != nil, !finished else {
+            report(self)
+            return
+        }
+        finished = true
+        state = "paired"
+        report(self)
+        queue.asyncAfter(deadline: .now() + .seconds(2)) { [weak self] in
+            guard let self else { return }
+            self.connection.cancel()
+            self.ended(self)
+        }
+    }
+
+    private func fail(_ reason: String) {
+        guard !finished else { return }
+        finished = true
+        state = "failed"
+        error = reason
+        connection.stateUpdateHandler = nil
+        connection.cancel()
+        report(self)
+        ended(self)
+    }
+
+    private func handle(_ message: [String: Any]) {
+        if let reason = message["cancel"] as? String {
+            fail(reason.isEmpty ? "The other Mac cancelled pairing." : reason)
+        } else if role == "host", commitment == nil, let value = message["commit"] as? String,
+                  let data = Data(hexString: value), data.count == 32 {
+            commitment = data
+            send(["nonce": hex(nonce)])
+        } else if role == "join", code.isEmpty, let value = message["nonce"] as? String,
+                  let hostNonce = Data(hexString: value), hostNonce.count == 32 {
+            send(["nonce": hex(nonce)])
+            showCode(hostNonce: hostNonce, joinNonce: nonce)
+        } else if role == "host", code.isEmpty, let commitment, let value = message["nonce"] as? String,
+                  let joinNonce = Data(hexString: value), joinNonce.count == 32 {
+            guard digest("commit", joinNonce) == commitment else {
+                cancel("The other Mac's pairing values did not match its commitment.")
+                return
+            }
+            showCode(hostNonce: nonce, joinNonce: joinNonce)
+        } else if !code.isEmpty, remoteOffer == nil, let offer = message["confirm"] {
+            remoteOffer = offer
+            complete()
+        } else {
+            cancel("The other Mac sent an unexpected pairing message.")
+        }
+    }
+
+    private func send(_ message: [String: Any]) {
+        guard let body = try? JSONSerialization.data(withJSONObject: message) else { return }
+        var frame = withUnsafeBytes(of: UInt32(body.count).bigEndian) { Data($0) }
+        frame.append(body)
+        connection.send(content: frame, completion: .contentProcessed { [weak self] error in
+            if let error { self?.fail("Could not reach the other Mac. \(error.localizedDescription)") }
+        })
+    }
+
+    private func receive() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, error in
+            guard let self, !self.finished else { return }
+            if let data { self.buffer.append(data) }
+            while self.buffer.count >= 4 {
+                let length = self.buffer.prefix(4).reduce(0) { ($0 << 8) | Int($1) }
+                guard length > 0, length <= maxPairingFrame else {
+                    self.fail("The other Mac sent an oversized pairing message.")
+                    return
+                }
+                guard self.buffer.count >= 4 + length else { break }
+                let body = self.buffer.subdata(in: self.buffer.startIndex + 4..<self.buffer.startIndex + 4 + length)
+                self.buffer.removeFirst(4 + length)
+                guard let message = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+                    self.fail("The other Mac sent an unreadable pairing message.")
+                    return
+                }
+                self.handle(message)
+                if self.finished { return }
+            }
+            if error != nil || done {
+                if self.state != "paired" { self.fail("The other Mac closed the connection.") }
+                return
+            }
+            self.receive()
+        }
+    }
+}
+
+extension Data {
+    init?(hexString: String) {
+        guard hexString.count % 2 == 0, hexString.allSatisfy(\.isHexDigit) else { return nil }
+        var bytes = [UInt8]()
+        var index = hexString.startIndex
+        while index < hexString.endIndex {
+            let next = hexString.index(index, offsetBy: 2)
+            guard let byte = UInt8(hexString[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        self.init(bytes)
+    }
+}
+
+// A joining Mac advertises on its own service while it waits; a host lists those Macs only
+// while its Add a Teammate window is open. Python drives both through small JSON files.
+final class Pairing {
+    private let identity: sec_identity_t
+    private let localPin: String
+    private let name: String
+    private let directory: URL
+    private let queue: DispatchQueue
+    private let timer: DispatchSourceTimer
+    private var listener: NWListener?
+    private var listenerName = ""
+    private var browser: NWBrowser?
+    private var requests: [String: (endpoint: NWEndpoint, name: String)] = [:]
+    private var writtenRequests = Data()
+    private var session: PairingSession?
+    private var handledStart = ""
+    private var handledConfirm = ""
+
+    init(identity: sec_identity_t, name: String, directory: URL, queue: DispatchQueue) {
+        self.identity = identity
+        self.localPin = ownPin(identity)
+        self.name = name
+        self.directory = directory
+        self.queue = queue
+        self.timer = DispatchSource.makeTimerSource(queue: queue)
+    }
+
+    func start() {
+        timer.schedule(deadline: .now(), repeating: .milliseconds(500))
+        timer.setEventHandler { [weak self] in self?.tick() }
+        timer.resume()
+    }
+
+    private func parameters() -> NWParameters {
+        let options = NWProtocolTLS.Options()
+        let security = options.securityProtocolOptions
+        sec_protocol_options_set_min_tls_protocol_version(security, .TLSv13)
+        sec_protocol_options_set_tls_resumption_enabled(security, false)
+        sec_protocol_options_set_tls_tickets_enabled(security, false)
+        sec_protocol_options_set_local_identity(security, identity)
+        sec_protocol_options_set_peer_authentication_required(security, true)
+        // Any certificate may connect here; the six-digit code authenticates the pairing.
+        sec_protocol_options_set_verify_block(security, { _, _, complete in complete(true) }, queue)
+        let settings = NWParameters(tls: options, tcp: NWProtocolTCP.Options())
+        settings.includePeerToPeer = true
+        settings.acceptLocalOnly = true
+        return settings
+    }
+
+    private func read(_ name: String) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent(name)) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private func write(_ name: String, _ value: Any) {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) else { return }
+        try? data.write(to: directory.appendingPathComponent(name), options: .atomic)
+    }
+
+    private func tick() {
+        let join = read("join.json")?["name"] as? String
+        if let join, listener == nil || listenerName != join {
+            startListener(join)
+        } else if join == nil, let listener {
+            listener.cancel()
+            self.listener = nil
+        }
+        let hosting = read("host.json") != nil
+        if hosting, browser == nil {
+            startBrowser()
+        } else if !hosting, let browser {
+            browser.cancel()
+            self.browser = nil
+            requests = [:]
+        }
+        let listed = requests.map { ["id": $0.key, "name": $0.value.name] }
+            .sorted { ($0["name"] ?? "") < ($1["name"] ?? "") }
+        if let data = try? JSONSerialization.data(withJSONObject: listed, options: [.sortedKeys]),
+           data != writtenRequests {
+            writtenRequests = data
+            try? data.write(to: directory.appendingPathComponent("requests.json"), options: .atomic)
+        }
+        if let start = read("pair-start.json"), let nonce = start["nonce"] as? String, nonce != handledStart,
+           let target = start["id"] as? String {
+            handledStart = nonce
+            connect(to: target)
+        }
+        if let confirm = read("pair-confirm.json"), let id = confirm["session"] as? String,
+           id != handledConfirm, let offer = confirm["offer"] {
+            handledConfirm = id
+            if session?.id == id { session?.confirm(offer) }
+        }
+        if let cancel = read("pair-cancel.json"), let id = cancel["session"] as? String, session?.id == id {
+            session?.cancel("Pairing was cancelled on the other Mac.")
+        }
+    }
+
+    private func startListener(_ display: String) {
+        listener?.cancel()
+        listenerName = display
+        do {
+            let service = try NWListener(using: parameters())
+            service.service = NWListener.Service(name: name, type: joinServiceType, domain: nil,
+                                                 txtRecord: NWTXTRecord(["name": String(display.prefix(80))]))
+            service.newConnectionHandler = { [weak self] connection in
+                guard let self, self.session == nil else { connection.cancel(); return }
+                self.begin(role: "join", connection: connection, peerName: "")
+            }
+            service.stateUpdateHandler = { [weak self] state in
+                if case .failed(let error) = state {
+                    self?.write("pairing.json", ["state": "failed", "error": "Could not advertise this Mac. \(error)"])
+                    self?.listener = nil
+                }
+            }
+            listener = service
+            service.start(queue: queue)
+        } catch {
+            write("pairing.json", ["state": "failed", "error": "Could not advertise this Mac. \(error)"])
+        }
+    }
+
+    private func startBrowser() {
+        let options = NWParameters()
+        options.includePeerToPeer = true
+        let service = NWBrowser(for: .bonjourWithTXTRecord(type: joinServiceType, domain: nil), using: options)
+        service.browseResultsChangedHandler = { [weak self] results, _ in
+            guard let self else { return }
+            var found: [String: (endpoint: NWEndpoint, name: String)] = [:]
+            for result in results {
+                guard case .service(let id, _, _, _) = result.endpoint, id != self.name else { continue }
+                var display = "Nearby Mac"
+                if case .bonjour(let txt) = result.metadata, let value = txt["name"], !value.isEmpty {
+                    display = value
+                }
+                found[id] = (result.endpoint, display)
+            }
+            self.requests = found
+        }
+        browser = service
+        service.start(queue: queue)
+    }
+
+    private func connect(to target: String) {
+        guard session == nil else { return }
+        guard let request = requests[target] else {
+            write("pairing.json", ["state": "failed", "error": "That Mac is no longer waiting to join."])
+            return
+        }
+        begin(role: "host", connection: NWConnection(to: request.endpoint, using: parameters()),
+              peerName: request.name)
+    }
+
+    private func begin(role: String, connection: NWConnection, peerName: String) {
+        let created = PairingSession(role: role, connection: connection, peerName: peerName, localPin: localPin,
+                                     queue: queue, report: { [weak self] session in
+            self?.write("pairing.json", session.status)
+            if let result = session.result { self?.write("pair-result.json", result) }
+        }, ended: { [weak self] session in
+            if self?.session === session { self?.session = nil }
+        })
+        session = created
+        write("pairing.json", created.status)
+        created.start()
+    }
+}
+
 final class Nearby {
     private let config: Bootstrap
     private let identity: sec_identity_t
     private let directory: URL
     private let queue = DispatchQueue(label: "neighbor-review.peer")
     private let timer: DispatchSourceTimer
+    private let pairing: Pairing
+    private let parent = getppid()
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var pins: [String: String] = [:]
@@ -256,6 +662,7 @@ final class Nearby {
     private var attempted: [String: Date] = [:]
     private var syncRequest: String?
     private var reached: [String: Date] = [:]
+    private var delivered: [String: (String, Date)] = [:]
     private var issues: [String: String] = [:]
     private var nextStart: [String: Date] = [:]
     private var backoff: [String: Double] = [:]
@@ -265,6 +672,7 @@ final class Nearby {
         self.identity = try loadIdentity(config)
         self.directory = URL(fileURLWithPath: config.directory, isDirectory: true)
         self.timer = DispatchSource.makeTimerSource(queue: queue)
+        self.pairing = Pairing(identity: identity, name: config.name, directory: directory, queue: queue)
     }
 
     private func parameters(for destination: String? = nil) -> NWParameters {
@@ -300,6 +708,7 @@ final class Nearby {
     }
 
     func start() {
+        pairing.start()
         timer.schedule(deadline: .now(), repeating: .seconds(2))
         timer.setEventHandler { [weak self] in self?.tick() }
         timer.resume()
@@ -388,6 +797,7 @@ final class Nearby {
             self.outgoing.removeValue(forKey: name)
             if success {
                 self.reached[name] = Date()
+                if let archive { self.delivered[name] = (archive.lastPathComponent, Date()) }
             }
         }
         outgoing[name] = transfer
@@ -406,6 +816,8 @@ final class Nearby {
     }
 
     private func tick() {
+        // PeerTree's service owns this helper; stop advertising as soon as it is gone.
+        if getppid() != parent { exit(0) }
         if let requested = readJSON("sync.json", as: String.self), requested != syncRequest {
             syncRequest = requested
             attempted.removeAll()
@@ -421,9 +833,17 @@ final class Nearby {
         let files = readJSON("exports.json", as: [String: String].self) ?? [:]
         let now = Date()
         for (name, endpoint) in endpoints where pins[name] != nil && outgoing[name] == nil {
-            let file = files[name]
             let sinceAttempt = now.timeIntervalSince(attempted[name] ?? .distantPast)
-            if (file != nil && sinceAttempt >= 6) || sinceAttempt >= 20 {
+            // A delivered batch isn't sent again while the teammate imports it. Quick probes
+            // fetch its updated inventory so the next batch follows; after a minute, resend.
+            var file = files[name]
+            var probeEvery = 20.0
+            if let current = file, let (sent, at) = delivered[name], sent == current {
+                let sinceDelivery = now.timeIntervalSince(at)
+                if sinceDelivery < 60 { file = nil }
+                if sinceDelivery < 120 { probeEvery = 6 }
+            }
+            if (file != nil && sinceAttempt >= 6) || sinceAttempt >= probeEvery {
                 let archive = file.map {
                     directory.appendingPathComponent("outgoing", isDirectory: true).appendingPathComponent($0)
                 }

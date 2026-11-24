@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -187,6 +188,9 @@ def validate(record):
                      for key, value in results.items()))
     elif kind == "shared":
         valid = ref_name(record.get("branch")) and is_hash(record.get("head"))
+    elif kind == "introduction":
+        valid = (short_text(record.get("key"), 200) and record["key"].startswith("ssh-ed25519 ")
+                 and is_hash(record.get("pin"), FINGERPRINT) and short_text(record.get("name"), 80))
     elif kind in ("snapshot", "quorum_root"):
         branches, tags = record.get("branches"), record.get("tags")
         default = record.get("default")
@@ -220,7 +224,7 @@ def validate(record):
 
 
 class Workspace:
-    def __init__(self, repo, project, name, check, lan=None, peer=None, bootstrap=False):
+    def __init__(self, repo, project, name, check, lan=None, peer=None, bootstrap=False, joining=False):
         self.root = Path(repo).resolve()
         self.root = Path(self.git("rev-parse", "--show-toplevel").strip())
         self.data = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir").strip())
@@ -259,13 +263,16 @@ class Workspace:
             if project is not None and project != self.data_state["project"]:
                 raise Problem(f"This clone already uses project {self.data_state['project']}.")
         else:
-            project = project or self.default_project()
+            # A joining Mac learns its project from the host it pairs with.
+            project = "" if joining else project or self.default_project()
             name = name or self.config("user.name") or getpass.getuser()
             self.data_state = {
                 "project": project[:80], "name": name[:80], "peers": {}, "integrator": "",
                 "records": {}, "runs": {}, "check": "",
-                "bootstrap": bootstrap,
+                "bootstrap": bootstrap or joining,
             }
+            if joining:
+                self.data_state.update(joining=True, staging=True)
         if check is not None:
             self.data_state["check"] = check
         if lan is not None:
@@ -1212,6 +1219,8 @@ class Workspace:
     def bootstrap_checkout(self):
         if not self.data_state.get("bootstrap"):
             raise Problem("This repository has already been cloned.")
+        if self.data_state.get("staging"):
+            raise Problem("Choose a folder for the project first.")
         snapshot = self.snapshot()
         if not snapshot:
             raise Problem("Choose the integrator and receive their signed repository snapshot first.")
@@ -1434,6 +1443,166 @@ class Workspace:
         self.update_tracking(old_tips)
         return {"message": "Team settings saved."}
 
+    def pairing_offer(self, role):
+        """What this Mac tells a newly paired Mac once both people confirm the code."""
+        offer = {"key": self.public, "name": self.data_state["name"]}
+        if role == "host":
+            offer.update(
+                project=self.data_state["project"],
+                object_format=self.git("rev-parse", "--show-object-format").strip(),
+                integrator=self.data_state["integrator"] or self.me,
+                teammates=[{"key": peer["key"], "name": peer["name"], **({"pin": peer["pin"]} if peer.get("pin") else {})}
+                           for peer in self.data_state["peers"].values()],
+            )
+        return offer
+
+    def apply_pairing(self, result):
+        offer, pin, role = result.get("offer"), result.get("pin"), result.get("role")
+        if not isinstance(offer, dict) or not is_hash(pin, FINGERPRINT) or role not in ("host", "join"):
+            raise Problem("The pairing reply was incomplete.")
+        if not short_text(offer.get("name"), 80):
+            raise Problem("The other Mac sent an invalid name.")
+        key = clean_key(str(offer.get("key", "")))
+        ident = key_id(key)
+        state = dict(self.data_state)
+        peers = dict(state["peers"])
+        if ident == self.me:
+            raise Problem("This Mac cannot pair with itself.")
+        if any(peer.get("pin") == pin for who, peer in peers.items() if who != ident):
+            raise Problem("That Mac's certificate is already paired with another teammate.")
+        peers[ident] = {**peers.get(ident, {}), "name": offer["name"], "key": key, "pin": pin}
+        if role == "host":
+            if state.get("quorum") and ident not in self.snapshot()["members"]:
+                raise Problem("The peer-majority snapshot pins these three signing identities.")
+            self.save({**state, "peers": peers})
+            # Teammates who already trust this Mac learn about the new one when they next sync.
+            intro_id, envelope = self.sign("introduction", key=key, pin=pin, name=offer["name"])
+            self.store({intro_id: envelope})
+            return {"message": f"Paired with {offer['name']}.", "name": offer["name"]}
+        if not state.get("joining"):
+            raise Problem("This Mac already belongs to a project.")
+        project, object_format = offer.get("project"), offer.get("object_format")
+        if not short_text(project, 80) or object_format not in ("sha1", "sha256"):
+            raise Problem("The host sent an invalid project.")
+        teammates = offer.get("teammates")
+        if not isinstance(teammates, list) or len(teammates) > 16:
+            raise Problem("The host sent an invalid team.")
+        for teammate in teammates:
+            if not isinstance(teammate, dict) or not short_text(teammate.get("name"), 80):
+                raise Problem("The host sent an invalid teammate.")
+            teammate_key = clean_key(str(teammate.get("key", "")))
+            teammate_id = key_id(teammate_key)
+            teammate_pin = teammate.get("pin")
+            if teammate_id in (self.me, ident) or (teammate_pin is not None and not is_hash(teammate_pin, FINGERPRINT)):
+                continue
+            peers[teammate_id] = {"name": teammate["name"], "key": teammate_key,
+                                  **({"pin": teammate_pin} if teammate_pin else {})}
+        integrator = offer.get("integrator") if offer.get("integrator") in peers else ident
+        if object_format != self.git("rev-parse", "--show-object-format").strip():
+            self.reinitialize(object_format)
+        self.save({**state, "project": project, "peers": peers, "integrator": integrator, "joining": False})
+        return {"message": f"Joined {project} with {offer['name']}.", "name": offer["name"]}
+
+    def pairing_status(self):
+        session = self.peer_session
+        status = session.pairing_status() if session else {"available": False}
+        return {**status, "joining": bool(self.data_state.get("joining")),
+                "staging": bool(self.data_state.get("staging")), "project": self.data_state["project"],
+                "name": self.data_state["name"], "path": str(self.root)}
+
+    def pairing_action(self, data):
+        session = self.peer_session
+        if not session or session.directory is None:
+            raise Problem("Turn on nearby Wi-Fi to pair Macs.")
+        action = data.get("action")
+        if action == "host":
+            return session.host_open()
+        if action == "start":
+            return session.pair_start(data.get("id"))
+        if action == "confirm":
+            return session.pair_confirm(data.get("code"))
+        if action == "cancel":
+            return session.pair_cancel()
+        raise Problem("Unknown pairing action.")
+
+    def apply_introductions(self, additions):
+        """Trust Macs that a trusted teammate paired in person, so one approval reaches the team."""
+        peers = dict(self.data_state["peers"])
+        members = set(self.snapshot()["members"]) if self.data_state.get("quorum") and self.snapshot() else None
+        for envelope in additions.values():
+            record = envelope["record"]
+            if record["kind"] != "introduction":
+                continue
+            try:
+                key = clean_key(record["key"])
+            except Problem:
+                continue
+            ident = key_id(key)
+            existing = peers.get(ident, {})
+            if (ident in (self.me, record["who"]) or existing.get("pin")
+                    or (members is not None and ident not in members)
+                    or any(peer.get("pin") == record["pin"] for who, peer in peers.items() if who != ident)):
+                continue
+            peers[ident] = {**existing, "name": existing.get("name", record["name"]), "key": key, "pin": record["pin"]}
+        if peers != self.data_state["peers"]:
+            self.save({**self.data_state, "peers": peers})
+
+    def reinitialize(self, object_format):
+        """Recreate a joining Mac's still-empty repository with the host's object format."""
+        if self.records or not self.data_state.get("joining"):
+            raise Problem("This repository already has history.")
+        git_dir = self.root / ".git"
+        keep = self.root / ".peertree-joining"
+        os.replace(self.data, keep)
+        shutil.rmtree(git_dir)
+        run(["git", "init", "--quiet", "--initial-branch=peertree-unborn", f"--object-format={object_format}"],
+            cwd=self.root)
+        os.replace(keep, self.data)
+
+    def choose_destination(self):
+        """Ask where the joined project lives, then move the staging repository there."""
+        with self.lock:
+            if not self.data_state.get("staging"):
+                raise Problem("This repository already has a folder.")
+            project = self.data_state["project"]
+            if not project:
+                raise Problem("Pair with a teammate first.")
+        script = ["/usr/bin/osascript", "-e", "on run argv", "-e", "activate",
+                  "-e", "POSIX path of (choose folder with prompt (item 1 of argv) default location (path to home folder))",
+                  "-e", "end run", f"Choose where to put {project}"]
+        result = subprocess.run(script, capture_output=True, text=True)
+        if result.returncode:
+            return {"message": "No folder chosen."}
+        chosen = Path(result.stdout.strip()).resolve()
+        folder_name = re.sub(r"[/:\x00]", "-", project).strip(". ") or "project"
+        destination = chosen if not any(chosen.iterdir()) else chosen / folder_name
+        if destination.exists() and any(destination.iterdir()):
+            raise Problem(f"{destination} already exists. Choose another folder.")
+        with self.lock:
+            self.relocate(destination)
+        return {"message": f"{project} will live in {destination}.", "path": str(destination)}
+
+    def relocate(self, destination):
+        source = self.root
+        if destination == source:
+            return
+        if destination.exists():
+            destination.rmdir()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.rename(source, destination)
+        except OSError:
+            shutil.move(str(source), str(destination))
+            # A copied lock file is a new file, so take the instance lock again.
+            self.instance.close()
+            self.instance = (destination / ".git" / "neighbor-review" / "instance.lock").open("a")
+            fcntl.flock(self.instance, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.root = destination
+        self.data = destination / ".git" / "neighbor-review"
+        self.key = self.data / "identity"
+        self.file = self.data / "state.json"
+        self.save({key: value for key, value in self.data_state.items() if key != "staging"})
+
     def cached_helpers(self):
         return [path for path in self.data.glob("neighbor-peer-*")
                 if re.fullmatch(r"neighbor-peer-[0-9a-f]{16}", path.name)
@@ -1559,58 +1728,70 @@ class Workspace:
                 records = json.loads(archive.read("records.json"))
                 if not isinstance(records, list):
                     raise Problem("Invalid exchange records.")
-                additions = {}
-                bootstrapping = self.data_state.get("bootstrap", False)
-                trusted = {self.me, *self.data_state["peers"]}
+                # Checking signatures is the slow part, so it runs before taking the lock, and
+                # records this Mac already holds are skipped: teammates resend a batch until
+                # they hear that it arrived.
+                with self.lock:
+                    known = self.records
+                    bootstrapping = self.data_state.get("bootstrap", False)
+                    trusted = {self.me, *self.data_state["peers"]}
+                verified = {}
                 for envelope in records:
                     record = envelope.get("record") if isinstance(envelope, dict) else None
                     if (bootstrapping and isinstance(record, dict)
                             and is_hash(record.get("who"), FINGERPRINT) and record["who"] not in trusted):
                         continue
+                    if isinstance(record, dict) and self.record_id(record) in known:
+                        continue
                     ident = self.verified(envelope, directory)
-                    if ident not in self.records:
-                        additions[ident] = envelope
-                all_records = self.records | additions
-                for ident, item in list(additions.items()):
-                    record = item["record"]
-                    if record["kind"] not in ("review", "comment", "check"):
-                        continue
-                    subject = all_records.get(record["proposal"], {}).get("record", {})
-                    if not subject and bootstrapping:
-                        del additions[ident]
-                        continue
-                    if (subject.get("kind") != "proposal"
-                            or (record["kind"] == "review" and subject["who"] == record["who"])):
-                        raise Problem("An exchange contains a comment, check, or review without a valid submission.")
-                if additions and "objects.bundle" in names:
-                    bundle = Path(archive.extract("objects.bundle", directory))
-                    self.git("bundle", "verify", str(bundle))
-                    self.git("bundle", "unbundle", str(bundle))
-                for item in additions.values():
-                    record = item["record"]
-                    if record["kind"] == "proposal":
-                        if not self.ancestor(record["base"], record["head"]):
-                            raise Problem("A submitted branch has an invalid Git base.")
-                self.store(additions)
-                people = self.data_state["peers"]
-                activity = []
-                for item in additions.values():
-                    record = item["record"]
-                    name = people.get(record["who"], {}).get("name", self.data_state["name"])
-                    if record["kind"] == "proposal":
-                        activity.append(f"{name} submitted “{record['title']}” for review.")
-                    elif record["kind"] == "review":
-                        activity.append(f"{name} reviewed a submitted branch.")
-                    elif record["kind"] == "comment":
-                        activity.append(f"{name} commented on a submitted branch.")
-                    elif record["kind"] == "check":
-                        activity.append(f"{name} ran local checks on a submitted branch.")
-                    elif record["kind"] in ("snapshot", "quorum_root"):
-                        activity.append(f"{name} published a repository snapshot.")
-                    elif record["kind"] == "shared":
-                        activity.append(f"{name} published a new {record['branch']} tip.")
-                return {"message": f"Imported {len(additions)} new exchange records.",
-                        "imported": len(additions), "activity": activity[:10]}
+                    verified[ident] = envelope
+                with self.lock:
+                    additions = {ident: envelope for ident, envelope in verified.items()
+                                 if ident not in self.records}
+                    all_records = self.records | additions
+                    for ident, item in list(additions.items()):
+                        record = item["record"]
+                        if record["kind"] not in ("review", "comment", "check"):
+                            continue
+                        subject = all_records.get(record["proposal"], {}).get("record", {})
+                        if not subject and bootstrapping:
+                            del additions[ident]
+                            continue
+                        if (subject.get("kind") != "proposal"
+                                or (record["kind"] == "review" and subject["who"] == record["who"])):
+                            raise Problem("An exchange contains a comment, check, or review without a valid submission.")
+                    if additions and "objects.bundle" in names:
+                        bundle = Path(archive.extract("objects.bundle", directory))
+                        self.git("bundle", "verify", str(bundle))
+                        self.git("bundle", "unbundle", str(bundle))
+                    for item in additions.values():
+                        record = item["record"]
+                        if record["kind"] == "proposal":
+                            if not self.ancestor(record["base"], record["head"]):
+                                raise Problem("A submitted branch has an invalid Git base.")
+                    self.store(additions)
+                    self.apply_introductions(additions)
+                    people = self.data_state["peers"]
+                    activity = []
+                    for item in additions.values():
+                        record = item["record"]
+                        name = people.get(record["who"], {}).get("name", self.data_state["name"])
+                        if record["kind"] == "proposal":
+                            activity.append(f"{name} submitted “{record['title']}” for review.")
+                        elif record["kind"] == "review":
+                            activity.append(f"{name} reviewed a submitted branch.")
+                        elif record["kind"] == "comment":
+                            activity.append(f"{name} commented on a submitted branch.")
+                        elif record["kind"] == "check":
+                            activity.append(f"{name} ran local checks on a submitted branch.")
+                        elif record["kind"] in ("snapshot", "quorum_root"):
+                            activity.append(f"{name} published a repository snapshot.")
+                        elif record["kind"] == "shared":
+                            activity.append(f"{name} published a new {record['branch']} tip.")
+                        elif record["kind"] == "introduction":
+                            activity.append(f"{name} paired {record['name']} with the team.")
+                    return {"message": f"Imported {len(additions)} new exchange records.",
+                            "imported": len(additions), "activity": activity[:10]}
 
     def view(self):
         branches = self.branches()
@@ -1677,6 +1858,7 @@ class Workspace:
             "notifications": {**NOTIFICATIONS, **self.data_state.get("notifications", {})},
             "branch_status": self.branch_status(branches, shared),
             "protected": list(self.protected_branches()), "bootstrap": self.data_state.get("bootstrap", False),
+            "joining": bool(self.data_state.get("joining")), "staging": bool(self.data_state.get("staging")),
             "snapshot": ({"branches": list(snapshot["branches"]), "tags": len(snapshot["tags"]),
                           "default": snapshot["default"]} if snapshot else None),
             "snapshot_sources": list(self.snapshot_sources()) if self.data_state["integrator"] == self.me else [],
@@ -1757,6 +1939,8 @@ def handle(workspace, token):
                         result = workspace.storage()
                     elif path.startswith("/api/diff/"):
                         result = workspace.inspect(path.rsplit("/", 1)[1])
+                    elif path == "/api/pairing":
+                        result = workspace.pairing_status()
                     elif path == "/api/export":
                         self.send(200, workspace.export(), "application/zip", "neighbor-exchange.zip")
                         return
@@ -1779,6 +1963,10 @@ def handle(workspace, token):
                         raise Problem("Expected an object.")
                     if path == "/api/check":
                         result = workspace.run_check(data.get("id"))
+                    elif path == "/api/destination":
+                        result = workspace.choose_destination()
+                    elif path == "/api/pairing":
+                        result = workspace.pairing_action(data)
                     elif path == "/api/agent":
                         result = agent.execute(workspace, data, MAX_EXCHANGE, pairing_code)
                     else:
@@ -1860,6 +2048,8 @@ def main():
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--desktop-ready", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--object-format", choices=["sha1", "sha256"], help="object format for a fresh clone")
+    parser.add_argument("--join", action="store_true",
+                        help="with clone: wait for a nearby teammate to add this Mac instead of naming a project")
     network = parser.add_mutually_exclusive_group()
     network.add_argument("--lan", dest="lan", action="store_true", default=None,
                          help="enable and remember nearby review alerts")
@@ -1874,8 +2064,10 @@ def main():
         parser.error("Use a name and project between 1 and 80 characters.")
     if args.check is not None and len(args.check) > 1000:
         parser.error("Keep the check command under 1,000 characters.")
-    if args.command == "clone" and (not args.destination or not args.project or args.repo):
-        parser.error("Use peertree clone DESTINATION --project PROJECT.")
+    if args.command == "clone" and (not args.destination or args.repo or bool(args.project) == args.join):
+        parser.error("Use peertree clone DESTINATION --project PROJECT, or peertree clone DESTINATION --join.")
+    if args.join and (args.command != "clone" or args.peer is False):
+        parser.error("Joining a teammate needs peertree clone DESTINATION --join with nearby Wi-Fi.")
     if not args.command and (args.destination or args.object_format):
         parser.error("A destination and object format require the clone command.")
     workspace = None
@@ -1885,7 +2077,8 @@ def main():
         peer = True if new_clone and args.peer is None and args.lan is None else args.peer
         try:
             workspace = Workspace(repo, args.project and args.project.strip(),
-                                  args.name and args.name.strip(), args.check, args.lan, peer, bootstrap)
+                                  args.name and args.name.strip(), args.check, args.lan,
+                                  True if args.join else peer, bootstrap, joining=args.join)
         except AlreadyOpen:
             if not args.desktop_ready:
                 raise

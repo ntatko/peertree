@@ -1,6 +1,5 @@
 const form = document.querySelector("form");
 const folder = document.querySelector("#folder");
-const project = document.querySelector("#project");
 const peer = document.querySelector("#peer");
 const status = document.querySelector("#status");
 const openButton = document.querySelector("#open");
@@ -8,15 +7,16 @@ const chooseButton = document.querySelector("#choose");
 const invoke = window.__TAURI__.core.invoke;
 let working = false;
 
-function cloning() {
-  return form.elements.mode.value === "clone";
+function joining() {
+  return form.elements.mode.value === "join";
 }
 
 function updateMode() {
-  const clone = cloning();
-  document.querySelector("#clone-fields").hidden = !clone;
-  project.required = clone;
-  openButton.textContent = clone ? "Start clone" : "Open worktree";
+  const join = joining();
+  document.querySelector("#open-fields").hidden = join;
+  document.querySelector("#join-help").hidden = !join;
+  folder.required = !join;
+  openButton.textContent = join ? "Join" : "Open worktree";
 }
 
 function showStatus(message, error = false) {
@@ -33,9 +33,9 @@ function lockControls(locked) {
 async function openWorkspace() {
   if (working || !form.reportValidity()) return;
   const settings = {
-    folder: folder.value,
-    cloneProject: cloning() ? project.value.trim() : null,
-    enablePeer: peer.checked,
+    folder: joining() ? "" : folder.value,
+    join: joining(),
+    enablePeer: joining() || peer.checked,
   };
   lockControls(true);
   showStatus("Opening workspace…");
@@ -50,22 +50,15 @@ async function openWorkspace() {
 }
 
 for (const input of form.elements.mode) {
-  input.addEventListener("change", () => {
-    if (cloning()) peer.checked = true;
-    updateMode();
-  });
+  input.addEventListener("change", updateMode);
 }
 
 chooseButton.addEventListener("click", async () => {
   if (working) return;
-  const clone = cloning();
   lockControls(true);
   try {
-    const selected = await invoke("choose_folder", { clone });
-    if (selected !== null) {
-      folder.value = selected;
-      if (clone && !project.value) project.value = selected.split("/").filter(Boolean).at(-1) || "";
-    }
+    const selected = await invoke("choose_folder");
+    if (selected !== null) folder.value = selected;
   } catch (error) {
     showStatus(String(error), true);
   } finally {

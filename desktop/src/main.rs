@@ -68,21 +68,14 @@ fn initial_workspace(window: WebviewWindow) -> Result<Option<(String, bool)>, St
 async fn choose_folder(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    clone: bool,
 ) -> Result<Option<String>, String> {
     from_launcher(&window)?;
     tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
-        let title = if clone {
-            "Choose an empty folder for the clone"
-        } else {
-            "Choose a Git worktree"
-        };
         let result = app
             .dialog()
             .file()
-            .set_title(title)
+            .set_title("Choose a Git worktree")
             .set_parent(&window)
-            .set_can_create_directories(clone)
             .blocking_pick_folder();
         result
             .map(|file| {
@@ -102,7 +95,7 @@ async fn open_workspace(
     app: tauri::AppHandle,
     window: WebviewWindow,
     folder: String,
-    clone_project: Option<String>,
+    join: bool,
     enable_peer: bool,
 ) -> Result<(), String> {
     from_launcher(&window)?;
@@ -115,15 +108,31 @@ async fn open_workspace(
         review.set_focus().map_err(|error| error.to_string())?;
         return Ok(());
     }
-    let folder = PathBuf::from(folder);
+    let folder = if join {
+        // The repository waits here until pairing names the project and the person picks a folder.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis();
+        let staging = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?
+            .join("Joining")
+            .join(stamp.to_string());
+        std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+        staging
+    } else {
+        PathBuf::from(folder)
+    };
     if !folder.is_absolute() {
         return Err("Choose a folder or enter its absolute path.".into());
     }
     let script = service_script(&app)?;
     let request = WorkspaceRequest {
         folder,
-        clone_project,
-        enable_peer,
+        join,
+        enable_peer: enable_peer || join,
     };
     let session =
         tauri::async_runtime::spawn_blocking(move || DesktopSession::start(&script, request))

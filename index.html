@@ -41,7 +41,7 @@
           <div id="worktree-picker">
             <select id="worktree" aria-label="Active worktree"></select>
           </div>
-          <button id="team-open" type="button"><span aria-hidden="true">◎</span> Pair a Mac</button>
+          <button id="team-open" type="button"><span aria-hidden="true">◎</span> Add a teammate</button>
           <button id="refresh" type="button" class="primary"><span aria-hidden="true">↻</span> Sync now</button>
         </div>
       </header>
@@ -52,7 +52,14 @@
       <section data-screen="clone" class="panel empty-detail" aria-label="First repository checkout" hidden>
         <h2 id="clone-title">Pair with the integrator</h2>
         <p class="help" id="clone-status"></p>
+        <form id="join-code-form" class="row join-code" hidden>
+          <label class="visually-hidden" for="join-code">Code shown on the host Mac</label>
+          <input id="join-code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="000 000" required>
+          <button type="submit" class="primary">Enter code</button>
+          <button id="join-cancel" type="button">Cancel</button>
+        </form>
         <div class="row">
+          <button id="clone-folder" type="button" class="primary" hidden>Choose folder…</button>
           <button id="clone-pair" type="button">Pair a Mac</button>
           <button id="clone-settings" type="button">Configure team</button>
           <button id="clone-import" type="button">Import exchange</button>
@@ -108,15 +115,6 @@
           <p class="help" id="storage-error" role="status" hidden></p>
         </section>
 
-        <section class="settings-group" aria-labelledby="pairing-heading">
-          <h2 id="pairing-heading"><label for="settings-pair-code">Your pairing code</label></h2>
-          <div class="settings-line">
-            <input id="settings-pair-code" class="settings-mono" readonly placeholder="Pairing code unavailable">
-            <button id="settings-copy-code" type="button" disabled><span aria-hidden="true">⧉</span> Copy</button>
-          </div>
-          <p id="settings-pair-help" class="help">Checking nearby Wi-Fi…</p>
-          <p id="settings-copy-status" class="help" role="status" hidden></p>
-        </section>
 
         <section class="settings-group" id="pipeline-settings" aria-labelledby="pipeline-heading">
           <h2 id="pipeline-heading"><label for="check-command">Local pipeline</label></h2>
@@ -227,20 +225,32 @@
   </dialog>
 
   <dialog id="team-dialog">
-    <div class="dialog-heading"><h2>Pair a Mac</h2><button class="quiet close" type="button" aria-label="Close">×</button></div>
-    <label>Your public key<input id="public-key" readonly></label>
-    <div class="row key-actions"><button id="copy-key" type="button">Copy public key</button><span id="key-status" class="help" role="status"></span></div>
-    <div id="peer-invite" hidden>
-      <label>Your nearby pairing code<input id="peer-code" readonly></label>
-      <div class="row key-actions"><button id="copy-peer-code" type="button">Copy pairing code</button><span id="peer-code-status" class="help" role="status"></span></div>
-    </div>
-    <p class="help" id="pair-help">Verify pairing codes or public keys with your teammates in person.</p>
-    <form id="peer-form" class="settings-section">
-      <h3>Trust a teammate</h3>
-      <label>Name<input name="name" required maxlength="80"></label>
-      <label>Pairing code or public key<input name="key" required maxlength="600" placeholder="NR1.… or ssh-ed25519 …"></label>
-      <button type="submit">Trust teammate</button>
-    </form>
+    <div class="dialog-heading"><h2>Add a teammate</h2><button class="quiet close" type="button" aria-label="Close">×</button></div>
+    <section id="pair-nearby" aria-live="polite">
+      <p class="help" id="pair-help">On the other Mac, open PeerTree and choose <strong>Join a teammate</strong>. It appears here when it's ready.</p>
+      <ul id="pair-requests" class="pair-requests"></ul>
+      <div id="pair-verify" class="pair-verify" hidden>
+        <p>On <strong id="pair-peer"></strong>, type this code:</p>
+        <p id="pair-code" class="pair-code"></p>
+        <p class="help">Confirm once the other Mac shows <strong>Code accepted</strong>.</p>
+        <div class="row">
+          <button id="pair-confirm" type="button" class="primary">The other Mac accepted the code</button>
+          <button id="pair-cancel" type="button">Cancel</button>
+        </div>
+      </div>
+      <p id="pair-state" class="help" role="status"></p>
+    </section>
+    <details class="settings-section">
+      <summary>Pair without nearby Wi-Fi</summary>
+      <p class="help">For exchanges shared by AirDrop. Compare public keys in person.</p>
+      <label>Your public key<input id="public-key" readonly></label>
+      <div class="row key-actions"><button id="copy-key" type="button">Copy public key</button><span id="key-status" class="help" role="status"></span></div>
+      <form id="peer-form">
+        <label>Teammate's name<input name="name" required maxlength="80"></label>
+        <label>Teammate's public key<input name="key" required maxlength="600" placeholder="ssh-ed25519 …"></label>
+        <button type="submit">Trust teammate</button>
+      </form>
+    </details>
   </dialog>
 </body>
 </html>

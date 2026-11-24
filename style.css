@@ -612,3 +612,34 @@ dialog form, #team-dialog[open], #commands-dialog[open] { display: grid; gap: 12
   .workspace-actions select { max-width: 125px; }
   .divergence { flex-wrap: wrap; }
 }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+#pair-nearby { display: grid; gap: 10px; }
+.pair-requests { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.pair-requests[hidden] { display: none; }
+.pair-request { width: 100%; justify-content: flex-start; text-align: left; }
+.pair-verify { display: grid; gap: 8px; justify-items: start; }
+.pair-verify[hidden] { display: none; }
+.pair-verify p { margin: 0; }
+.pair-code {
+  font: 600 2.4rem/1.1 var(--mono);
+  letter-spacing: .12em;
+  color: var(--accent);
+}
+#team-dialog details { display: grid; gap: 10px; }
+#team-dialog summary { cursor: pointer; color: var(--muted); }
+#team-dialog details form { display: grid; gap: 10px; }
+.join-code input {
+  width: 9ch;
+  font: 600 1.3rem var(--mono);
+  letter-spacing: .1em;
+  text-align: center;
+}
+.join-code[hidden] { display: none; }

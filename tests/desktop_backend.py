@@ -340,6 +340,98 @@ def run_batched_catch_up_test(folder):
         receiver.instance.close()
 
 
+def run_pairing_test(folder):
+    def git(cwd, *args):
+        return app.run(["git", "-c", "user.name=Pair", "-c", "user.email=test@example.invalid", *args], cwd=cwd)
+
+    def sync(sender, receiver):
+        plan = sender.inventory_plan(list(receiver.records))
+        if plan["missing"]:
+            receiver.import_exchange(sender.export(plan))
+
+    def pin_for(workspace):
+        return nearby.decode_code(app.pairing_code(workspace))[1]
+
+    host_repo, third_repo, staging = folder / "host", folder / "third", folder / "staging"
+    git(folder, "init", "-qb", "main", "--object-format=sha256", str(host_repo))
+    (host_repo / "README.md").write_text("Pairing demo\n")
+    git(host_repo, "add", ".")
+    git(host_repo, "commit", "-qm", "Start")
+    git(folder, "clone", "-q", str(host_repo), str(third_repo))
+    host = app.Workspace(host_repo, "Pairing demo", "Host", None)
+    third = app.Workspace(third_repo, "Pairing demo", "Third", None)
+    app.prepare_clone(staging, None)
+    joiner = app.Workspace(staging, None, "Joiner", None, peer=True, joining=True)
+    try:
+        assert joiner.data_state["project"] == "" and joiner.data_state["joining"] and joiner.data_state["staging"]
+        third.team({"action": "add", "name": "Host", "key": app.pairing_code(host)})
+        host.team({"action": "add", "name": "Third", "key": app.pairing_code(third)})
+        host.team({"action": "integrator", "id": host.me})
+        host.publish_snapshot({"branches": ["main"], "default": "main"})
+
+        # Both people confirmed the code; each Mac now applies the other's offer and TLS pin.
+        joined = joiner.apply_pairing({"role": "join", "pin": pin_for(host), "offer": host.pairing_offer("host")})
+        added = host.apply_pairing({"role": "host", "pin": pin_for(joiner), "offer": joiner.pairing_offer("join")})
+        assert joined["name"] == "Host" and added["name"] == "Joiner"
+        assert joiner.data_state["project"] == "Pairing demo" and not joiner.data_state["joining"]
+        assert joiner.git("rev-parse", "--show-object-format").strip() == "sha256"
+        assert joiner.data_state["integrator"] == host.me
+        assert joiner.data_state["peers"][host.me]["pin"] == pin_for(host)
+        assert joiner.data_state["peers"][third.me]["pin"] == pin_for(third)
+        assert host.data_state["peers"][joiner.me]["pin"] == pin_for(joiner)
+
+        # The host's signed introduction reaches the third teammate on the next sync.
+        sync(host, third)
+        assert third.data_state["peers"][joiner.me]["pin"] == pin_for(joiner)
+
+        sync(host, joiner)
+        assert joiner.snapshot() and joiner.data_state["staging"]
+        try:
+            joiner.bootstrap_checkout()
+            raise AssertionError("Checkout ran before the project had a folder.")
+        except app.Problem as error:
+            assert "folder" in str(error)
+        destination = folder / "chosen" / "Pairing demo"
+        joiner.relocate(destination)
+        assert not staging.exists() and not joiner.data_state.get("staging")
+        assert json.loads((destination / ".git" / "neighbor-review" / "state.json").read_text())["project"] == "Pairing demo"
+        joiner.bootstrap_checkout()
+        assert (destination / "README.md").read_text() == "Pairing demo\n"
+    finally:
+        for workspace in (host, third, joiner):
+            workspace.instance.close()
+
+
+def run_pairing_code_test(folder):
+    repo = folder / "repo"
+    app.run(["git", "init", "-q", str(repo)])
+    workspace = app.Workspace(repo, "Code demo", "Joiner", None)
+    try:
+        session = nearby.PeerSession(workspace, app.run)
+        session.directory = folder
+        (folder / "pairing.json").write_text(json.dumps(
+            {"session": "s1", "role": "join", "state": "verify", "code": "042137", "peer": ""}))
+        assert "code" not in session.pairing_status()["session"]
+        for attempt in range(2):
+            try:
+                session.pair_confirm("111111")
+                raise AssertionError("A wrong code was accepted.")
+            except ValueError as error:
+                assert "doesn't match" in str(error)
+        assert not (folder / "pair-confirm.json").exists()
+        session.pair_confirm("042 137")
+        confirmed = json.loads((folder / "pair-confirm.json").read_text())
+        assert confirmed["session"] == "s1" and confirmed["offer"]["key"] == workspace.public
+        session.code_attempts = 2
+        try:
+            session.pair_confirm("999999")
+        except ValueError as error:
+            assert "three times" in str(error)
+        assert json.loads((folder / "pair-cancel.json").read_text()) == {"session": "s1"}
+    finally:
+        workspace.instance.close()
+
+
 def run_test(repo):
     with patch.object(app, "ThreadingHTTPServer", LocalServer):
         assert run_main(repo) == {"port": LocalServer.server_port, "owned": True}
@@ -376,5 +468,9 @@ if __name__ == "__main__":
         run_automatic_pipeline_test(Path(temporary).resolve())
     with tempfile.TemporaryDirectory(prefix="peertree-batched-catch-up-test-") as temporary:
         run_batched_catch_up_test(Path(temporary).resolve())
+    with tempfile.TemporaryDirectory(prefix="peertree-pairing-test-") as temporary:
+        run_pairing_test(Path(temporary).resolve())
+    with tempfile.TemporaryDirectory(prefix="peertree-pairing-code-test-") as temporary:
+        run_pairing_code_test(Path(temporary).resolve())
     print("Passed desktop startup, repository browser, settings, signed reviews, automatic pipelines, "
-          "batched catch-up, and clone checks.")
+          "batched catch-up, nearby pairing, and clone checks.")

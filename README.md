@@ -60,7 +60,7 @@ The command opens your browser, selects the current worktree, and lists the othe
 
 On first launch the project defaults to the Git origin's repository name and your display name defaults to Git's `user.name`. When teammates' origins use different names, launch with the same `--project "your-project"` on all three Macs from the start. Use `--name "Your Name"` on first launch to override your display name.
 
-In **Settings**, choose the same integrator on every laptop and configure your fallback local pipeline command, such as `./scripts/check.sh` or `npm test`. For nearby Wi-Fi, add both teammates using the pairing codes below. For manual exchanges alone, use their public keys. Verify the codes or keys in person. The integrator needs a configured Git name and email to create merge commits. The repo's Git metadata directory stores identities, reviews, and settings across sessions and worktrees.
+In **Settings**, choose the same integrator on every laptop and configure your fallback local pipeline command, such as `./scripts/check.sh` or `npm test`. For nearby Wi-Fi, add teammates with **Add a teammate** as described below. For manual exchanges alone, compare and trust public keys in person. The integrator needs a configured Git name and email to create merge commits. The repo's Git metadata directory stores identities, reviews, and settings across sessions and worktrees.
 
 ## Use nearby Wi-Fi
 
@@ -72,9 +72,11 @@ peertree --peer
 
 Use this mode where direct device-to-device transfers are approved. Keep Wi-Fi enabled. PeerTree uses Apple peer-to-peer Wi-Fi through Network.framework and discovers peers with Bonjour. The Macs can discover and connect directly without an office access point. macOS local-network permissions and device management settings still apply.
 
-Open **Pair a Mac** and copy your nearby pairing code. Verify and exchange codes in person, then use **Trust teammate** to add each teammate. Add both teammates on all three Macs. If you previously trusted their public keys, add their pairing codes once to enable encrypted connections. The pairing code contains the review signing key and the certificate fingerprint. Both Macs must present their pinned certificate before a connection carries an exchange.
+To add a teammate, open PeerTree on the new Mac and choose **Join a teammate's project**. On a Mac that already has the project, choose **Add a teammate** and select the new Mac from the list. Both screens show the same six-digit code. Type it on the new Mac, and once it shows **Code accepted**, confirm on the host. The code covers both Macs' certificates and a random value from each, so a device in between can't make the two screens agree. Confirming swaps signing keys and certificate fingerprints. The new Mac also learns the project, its integrator, and the host's other teammates, and the host signs an introduction so those teammates trust the new Mac when they next sync. Both Macs must present their pinned certificate before a connection carries an exchange.
 
-With both apps open and in range, submitted branches, comments, check results, decisions, and published tips sync automatically. Paired teammates reconnect on later launches. They compare the signed record IDs they hold and exchange the missing records and Git objects. A teammate can relay a record signed by its original author to another teammate who trusts that signer. Nearby sync uses the new protocol in 0.5.0, so upgrade all three Macs together. Use **Sync now** to request a nearby exchange and refresh the `team/` tracking refs. In **Branches**, choose **Fast-forward** when you're ready to update a local branch. Use `peertree --no-peer` to turn nearby Wi-Fi off.
+For ZIP exchanges without nearby Wi-Fi, use **Pair without nearby Wi-Fi** in the same window to compare and trust public keys in person.
+
+With both apps open and in range, submitted branches, comments, check results, decisions, and published tips sync automatically. Paired teammates reconnect on later launches. They compare the signed record IDs they hold and exchange the missing records and Git objects. A teammate can relay a record signed by its original author to another teammate who trusts that signer. Nearby sync uses the new protocol in 0.5.0, and pairing uses the join flow in 0.5.1, so upgrade all three Macs together. A Mac that is far behind catches up in batches. Use **Sync now** to request a nearby exchange and refresh the `team/` tracking refs. In **Branches**, choose **Fast-forward** when you're ready to update a local branch. Use `peertree --no-peer` to turn nearby Wi-Fi off.
 
 ## Agent CLI and local Git remote
 
@@ -140,17 +142,13 @@ python3 ci/checks.py test
 
 ## Clone from a teammate
 
-Use PeerTree 0.5.0 or later on every Mac. The integrator opens an existing working copy with nearby Wi-Fi enabled and chooses **Branches → Publish repository snapshot**. Select the branches you were protecting and the default checkout branch. PeerTree can offer local branches and cached `origin` branch tips. The signed snapshot includes those branches' Git history and the local tags reachable from them. It stays current as the integrator publishes branch tips.
+Use PeerTree 0.5.1 or later on every Mac. The integrator opens an existing working copy with nearby Wi-Fi enabled and chooses **Branches → Publish repository snapshot**. Select the branches you were protecting and the default checkout branch. PeerTree can offer local branches and cached `origin` branch tips. The signed snapshot includes those branches' Git history and the local tags reachable from them. It stays current as the integrator publishes branch tips.
 
-On the new Mac, choose **Clone from Teammate** when opening PeerTree from Applications, or run:
+On the new Mac, open PeerTree from Applications and choose **Join a teammate's project**. You don't need a folder or the project name yet. On a Mac that has the project, choose **Add a teammate**, select the new Mac, and check the six-digit code together as described in Nearby Wi-Fi. The repository starts arriving right away. Choose **Choose folder…** to pick where it lives, then **Check out repository** once the snapshot is in. PeerTree creates the protected branches and tags locally and opens the default branch.
 
-```sh
-peertree clone "./my-project" --project "my-project"
-```
+From Terminal, `peertree clone ./staging --join` does the same, and `peertree clone ./my-project --project "my-project"` still clones by project name with manually trusted keys. If direct Wi-Fi is unavailable, the integrator can export the same signed snapshot as a ZIP for the new Mac to import.
 
-Use an empty destination and the project name shown on the integrator's screen. Exchange pairing codes in **Pair a Mac** and designate the teammate providing the snapshot as integrator in **Settings**. With both apps open nearby, the snapshot arrives automatically. Review the branch and tag counts, then click **Check out repository**. PeerTree creates the protected branches and tags locally and opens the default branch. If direct Wi-Fi is unavailable, the integrator can export the same signed snapshot as a ZIP for the new Mac to import.
-
-Use `--object-format sha256` for a SHA-256 project. PeerTree carries Git refs and tracked files. GitLab access rules, merge request state, CI variables, and runner configuration are server-side. LFS objects and submodule repositories need their own approved transfer.
+When cloning by project name, use `--object-format sha256` for a SHA-256 project; joining picks the host's format automatically. PeerTree carries Git refs and tracked files. GitLab access rules, merge request state, CI variables, and runner configuration are server-side. LFS objects and submodule repositories need their own approved transfer.
 
 ## Share a ZIP manually
 

@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 pub struct WorkspaceRequest {
     pub folder: PathBuf,
-    pub clone_project: Option<String>,
+    /// Wait in a staging folder for a nearby teammate to add this Mac.
+    pub join: bool,
     pub enable_peer: bool,
 }
 
@@ -36,17 +37,8 @@ impl DesktopSession {
             .arg(script)
             .args(["--desktop-ready", "--no-open"]);
         command.env("PATH", executable_path());
-        if let Some(project) = request.clone_project {
-            let project = project.trim();
-            if project.is_empty() || project.chars().count() > 80 {
-                return Err(
-                    "Enter the project name shown on the integrator’s PeerTree window.".into(),
-                );
-            }
-            command
-                .arg("clone")
-                .arg(folder)
-                .arg(format!("--project={project}"));
+        if request.join {
+            command.arg("clone").arg(folder).arg("--join");
         } else {
             command.arg("--repo").arg(folder);
         }
