@@ -53,6 +53,9 @@ def parse_cli(arguments):
         operation.add_argument("id")
         if action == "comment":
             add_body(operation, "body", 4000, required=True)
+            operation.add_argument("--file", help="File path in the review diff")
+            operation.add_argument("--line", type=int, help="Line number in the review diff")
+            operation.add_argument("--side", choices=("old", "new"), help="Defaults to new for line comments")
         elif action == "review":
             votes = operation.add_mutually_exclusive_group(required=True)
             votes.add_argument("--approve", action="store_const", const="approve", dest="vote")
@@ -89,6 +92,9 @@ def parse_cli(arguments):
     supplied.add_argument("--key-file", type=Path)
     integrator = settings.add_parser("integrator")
     integrator.add_argument("id")
+    settings.add_parser("quorum-init", help="Create the shared three-peer starting snapshot")
+    quorum = settings.add_parser("quorum-join", help="Join a verified starting snapshot by its full ID")
+    quorum.add_argument("id")
     pipeline = settings.add_parser("pipeline")
     pipeline.add_argument("command")
 
@@ -104,6 +110,12 @@ def parse_cli(arguments):
     if key:
         limit = request.pop("body_limit")
         request[key] = limited_text(path, limit) if path else (request.get(key) or "")
+    if request["group"] == "pr" and request["action"] == "comment":
+        file, line, side = (request.pop(field) for field in ("file", "line", "side"))
+        if any(value is not None for value in (file, line, side)):
+            if not file or not line or line < 1:
+                raise AgentError("Use --file and a positive --line together for a line comment.")
+            request["anchor"] = {"file": file, "line": line, "side": side or "new"}
     key_file = request.pop("key_file", None)
     if key_file:
         request["key"] = limited_text(key_file, 1024)
@@ -239,6 +251,8 @@ def act(workspace, request, max_exchange, identity_for):
             return workspace.team({"action": "add", "name": request["teammate"], "key": request["key"]})
         if action == "integrator":
             return workspace.team({"action": "integrator", "id": request["id"]})
+        if action in ("quorum-init", "quorum-join"):
+            return workspace.team(request)
         if action == "pipeline":
             return workspace.team({"action": "check", "command": request["command"]})
     raise AgentError("Unknown PeerTree command.")

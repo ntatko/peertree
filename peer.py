@@ -72,6 +72,7 @@ class PeerSession:
         self.error = ""
         self.received = ""
         self.received_count = 0
+        self.received_at = None
         self.received_activity = []
         self.initializing = True
         self.code = ""
@@ -88,6 +89,12 @@ class PeerSession:
         self.thread.join(timeout=2)
         if self.helper is not None and self.helper.poll() is None:
             self.helper.terminate()
+
+    def request_sync(self):
+        if self.directory is None or self.helper is None or self.helper.poll() is not None:
+            return False
+        write_atomic(self.directory / "sync.json", json.dumps(str(time.monotonic_ns())).encode())
+        return True
 
     def executable(self):
         bundled = ASSETS.parent / "Helpers" / "peertree-peer"
@@ -180,6 +187,7 @@ class PeerSession:
                         if result["imported"]:
                             self.received = result["message"]
                             self.received_count += 1
+                            self.received_at = time.time()
                             self.received_activity = result["activity"]
                         self.error = ""
                     except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as error:
@@ -245,11 +253,14 @@ class PeerSession:
                 native = json.loads((self.directory / "status.json").read_bytes())
             except (OSError, ValueError):
                 pass
-        names = {ident[:32]: peer["name"] for ident, peer in self.workspace.data_state["peers"].items()}
+        online = set(native.get("online", []))
+        peers = self.workspace.data_state["peers"]
+        reachable = [ident for ident, peer in peers.items() if peer.get("pin") and ident[:32] in online]
         return {
             "enabled": True, "starting": self.initializing, "code": self.code,
-            "online": [names.get(ident, ident) for ident in native.get("online", [])],
+            "online": [peers[ident]["name"] for ident in reachable], "reachable": reachable,
             "error": self.error or native.get("error", ""),
             "received": self.received, "received_count": self.received_count,
+            "received_at": self.received_at,
             "activity": self.received_activity,
         }

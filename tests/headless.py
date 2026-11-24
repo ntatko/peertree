@@ -98,10 +98,18 @@ def run_test(root):
     comment = root / "comment.md"
     comment.write_text("Relay this review 🌳\n")
     cli(blair, "pr", "comment", pr, "--body-file", comment)
+    cli(blair, "pr", "comment", pr, "--file", "code", "--line", 1, "--body", "Explain this change")
+    cli(blair, "pr", "comment", pr, "--file", "code", "--line", 1, "--side", "old", "--body", "Old behavior")
+    cli(blair, "pr", "comment", pr, "--file", "code", "--line", 20, "--body", "Outside the diff", error="Choose a line")
     cli(blair, "pr", "review", pr, "--approve", "--revision", commit)
     relay(blair, casey, root, "review", {"proposal", "comment", "review"})
     view = cli(casey, "pr", "show", pr)
-    assert view["comments"][0]["body"] == "Relay this review 🌳"
+    comments = {row["body"]: row.get("anchor") for row in view["comments"]}
+    assert comments == {
+        "Relay this review 🌳": None,
+        "Explain this change": {"file": "code", "side": "new", "line": 1},
+        "Old behavior": {"file": "code", "side": "old", "line": 1},
+    }
     assert view["approvals"] == 1 and view["required"] == 2
     cli(casey, "pr", "merge", pr, error="1 of 2")
     cli(casey, "pr", "review", pr, "--approve", "--revision", commit)
@@ -109,6 +117,12 @@ def run_test(root):
 
     assert cli(blair, "checks", "run", pr)["checks"] == {"lint": True, "test": True}
     relay(blair, casey, root, "checks", {"check"})
+    checked = cli(casey, "pr", "show", pr)
+    assert not checked["missing"]
+    assert {(row["who"], row["check"], row["passed"]) for row in checked["check_runs"]} == {
+        (identities["Blair"]["id"], "lint", True),
+        (identities["Blair"]["id"], "test", True),
+    }
     git(casey, "switch", "-q", "dev")
     git(casey, "commit", "--allow-empty", "-qm", "Local bypass in test fixture")
     cli(casey, "publish", error="approved branch review")

@@ -212,6 +212,7 @@ final class Nearby {
     private var incoming: [UUID: Transfer] = [:]
     private var outgoing: [String: Transfer] = [:]
     private var attempted: [String: Date] = [:]
+    private var syncRequest: String?
     private var reached: [String: Date] = [:]
     private var issues: [String: String] = [:]
     private var nextStart: [String: Date] = [:]
@@ -363,6 +364,10 @@ final class Nearby {
     }
 
     private func tick() {
+        if let requested = readJSON("sync.json", as: String.self), requested != syncRequest {
+            syncRequest = requested
+            attempted.removeAll()
+        }
         let configuredPins = readJSON("peers.json", as: [String: String].self) ?? [:]
         for name in Set(pins.keys).union(configuredPins.keys) where pins[name] != configuredPins[name] {
             attempted.removeValue(forKey: name)

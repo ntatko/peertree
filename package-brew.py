@@ -7,13 +7,19 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 
 
 VERSION = "0.5.0"
 SOURCE = Path(__file__).resolve().parent
-RESOURCES = ("app.py", "agent.py", "lan.py", "peer.py", "app.js", "index.html", "style.css")
+ICON = "desktop/frontend/peertree-icon.png"
+RESOURCES = (
+    "app.py", "agent.py", "lan.py", "peer.py", "quorum.py", "app.js", "index.html", "style.css", ICON,
+    "assets/seti/theme.json", "assets/seti/seti.woff", "assets/seti/LICENSE.txt",
+    "assets/marked/marked.umd.js", "assets/marked/LICENSE.md",
+)
 SERVICE = "_peertree-v2._tcp"
 RUST_TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin")
 
@@ -66,6 +72,22 @@ def rust_desktop(build, output):
     run("/usr/bin/lipo", "-create", *compiled, "-output", output)
 
 
+def app_icon(build, output):
+    # Modern ICNS entries contain PNG images, with separate types for Retina sizes.
+    entries = {
+        16: (b"icp4",), 32: (b"icp5", b"ic11"), 64: (b"ic12",), 128: (b"ic07",),
+        256: (b"ic08", b"ic13"), 512: (b"ic09", b"ic14"), 1024: (b"ic10",),
+    }
+    chunks = []
+    for size, kinds in entries.items():
+        target = build / f"icon-{size}.png"
+        run("/usr/bin/sips", "-z", size, size, SOURCE / ICON, "--out", target)
+        png = target.read_bytes()
+        chunks.extend(kind + struct.pack(">I", len(png) + 8) + png for kind in kinds)
+    body = b"".join(chunks)
+    output.write_bytes(b"icns" + struct.pack(">I", len(body) + 8) + body)
+
+
 def assemble(build, owner, signing_identity, desktop=False):
     app = build / "PeerTree.app"
     contents = app / "Contents"
@@ -77,10 +99,14 @@ def assemble(build, owner, signing_identity, desktop=False):
     for path in (launcher.parent, helper.parent, resources):
         path.mkdir(parents=True)
     for name in RESOURCES:
-        shutil.copy2(SOURCE / name, resources / name)
+        target = resources / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SOURCE / name, target)
+    app_icon(build, resources / "PeerTree.icns")
     info = {
         "CFBundleDisplayName": "PeerTree",
         "CFBundleExecutable": windowed.name if desktop else launcher.name,
+        "CFBundleIconFile": "PeerTree.icns",
         "CFBundleIdentifier": f"io.github.{owner.lower()}.peertree",
         "CFBundleName": "PeerTree",
         "CFBundlePackageType": "APPL",

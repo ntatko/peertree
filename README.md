@@ -60,7 +60,7 @@ The command opens your browser, selects the current worktree, and lists the othe
 
 On first launch the project defaults to the Git origin's repository name and your display name defaults to Git's `user.name`. When teammates' origins use different names, launch with the same `--project "your-project"` on all three Macs from the start. Use `--name "Your Name"` on first launch to override your display name.
 
-In **Team settings**, choose the same integrator on every laptop and configure your local check command, such as `./scripts/check.sh` or `npm test`. For nearby Wi-Fi, add both teammates using the pairing codes below. For manual exchanges alone, use their public keys. Verify the codes or keys in person. The integrator needs a configured Git name and email to create merge commits. The repo's Git metadata directory stores identities, reviews, and settings across sessions and worktrees.
+In **Settings**, choose the same integrator on every laptop and configure your fallback local pipeline command, such as `./scripts/check.sh` or `npm test`. For nearby Wi-Fi, add both teammates using the pairing codes below. For manual exchanges alone, use their public keys. Verify the codes or keys in person. The integrator needs a configured Git name and email to create merge commits. The repo's Git metadata directory stores identities, reviews, and settings across sessions and worktrees.
 
 ## Use nearby Wi-Fi
 
@@ -72,9 +72,9 @@ peertree --peer
 
 Use this mode where direct device-to-device transfers are approved. Keep Wi-Fi enabled. PeerTree uses Apple peer-to-peer Wi-Fi through Network.framework and discovers peers with Bonjour. The Macs can discover and connect directly without an office access point. macOS local-network permissions and device management settings still apply.
 
-In **Team settings**, each person copies their **nearby pairing code**. Exchange and verify the codes in person, then paste each teammate's code into **Trust a teammate**. Add both teammates on all three Macs. If you previously trusted their public keys, add their pairing codes once to enable encrypted connections. The pairing code contains the review signing key and the certificate fingerprint. Both Macs must present their pinned certificate before a connection carries an exchange.
+Open **Pair a Mac** and copy your nearby pairing code. Verify and exchange codes in person, then use **Trust teammate** to add each teammate. Add both teammates on all three Macs. If you previously trusted their public keys, add their pairing codes once to enable encrypted connections. The pairing code contains the review signing key and the certificate fingerprint. Both Macs must present their pinned certificate before a connection carries an exchange.
 
-With both apps open and in range, submitted branches, comments, check results, decisions, and published tips sync automatically. Paired teammates reconnect on later launches. They compare the signed record IDs they hold and exchange the missing records and Git objects. A teammate can relay a record signed by its original author to another teammate who trusts that signer. Nearby sync uses the new protocol in 0.5.0, so upgrade all three Macs together. Use **Sync dev** or **Sync main** when you're ready to move those local branches. Use `peertree --no-peer` to turn nearby Wi-Fi off.
+With both apps open and in range, submitted branches, comments, check results, decisions, and published tips sync automatically. Paired teammates reconnect on later launches. They compare the signed record IDs they hold and exchange the missing records and Git objects. A teammate can relay a record signed by its original author to another teammate who trusts that signer. Nearby sync uses the new protocol in 0.5.0, so upgrade all three Macs together. Use **Sync now** to request a nearby exchange and refresh the `team/` tracking refs. In **Branches**, choose **Fast-forward** when you're ready to update a local branch. Use `peertree --no-peer` to turn nearby Wi-Fi off.
 
 ## Agent CLI and local Git remote
 
@@ -88,6 +88,7 @@ peertree pr show "$PR_ID" --json
 peertree pr diff "$PR_ID"
 peertree checks run "$PR_ID" --json
 peertree pr comment "$PR_ID" --body-file review.md --json
+peertree pr comment "$PR_ID" --file src/main.rs --line 42 --body "Can we simplify this?" --json
 peertree pr review "$PR_ID" --approve --revision "$COMMIT_SHA" --json
 peertree pr merge "$PR_ID" --revision "$COMMIT_SHA" --json
 ```
@@ -97,6 +98,16 @@ Use `--json` for a machine-readable result. A completed check run with failing c
 Run `peertree sync` to create a local Git remote named `team`. It exposes the integrator's published branches, such as `team/dev`, and advances the tracking refs as signed tips arrive. `git fetch team` reads this local replica. Run `peertree sync dev` to fast-forward the local branch when ready.
 
 For a manual transfer, `peertree sync --export exchange.zip` creates a full exchange and `peertree sync --import exchange.zip` receives one. To send a smaller exchange, the receiver first writes their record inventory with `peertree sync --inventory have.json`. The sender runs `peertree sync --export updates.zip --since have.json`.
+
+## Peer majority for three Macs
+
+On all three Macs, update PeerTree and trust both teammates' signing keys. On the Mac with the existing repository, open **Settings → Team settings** and choose **Create peer starting snapshot**. This captures the current shared tips when migrating an existing team. Sync or exchange the snapshot, compare its full ID on all three Macs, and choose **Join peer majority** everywhere. An empty clone can join the same snapshot and check out the latest agreed tip.
+
+The snapshot pins the three signing identities and the initial protected branches. Any two peers can agree on the next tip. One teammate's approval and passing committed checks make the exact submitted commit eligible. PeerTree exchanges its signed branch decisions over nearby Wi-Fi or ZIP, so a teammate who was offline can catch up through either peer.
+
+Submit a commit based on the current shared tip. If two reviews compete, PeerTree settles one branch update first. Rebase the other branch onto that tip and submit its new revision. The agreed tip advances under team/main or team/dev. Use **Fast-forward** to update a checked-out branch when you are ready. **Retry peer merge** lets another peer resume a stalled vote.
+
+Teams that keep their existing integrator settings continue to use the integrator workflow below.
 
 ## Repository merge policy
 
@@ -122,11 +133,18 @@ peertree publish --branch main --branch dev --default main
 peertree policy show --base dev --json
 ```
 
-The last published target commit supplies the active policy. A branch can change this file through review. Its old policy continues to govern the merge, and signed checks and approvals count against the reviewed commit and policy. Run checks explicitly from a temporary checkout. A repository without a committed policy keeps the existing two-reviewer workflow and its locally configured pipeline command.
+The last published target commit supplies the active policy. A branch can change this file through review. Its old policy continues to govern the merge, and signed checks and approvals count against the reviewed commit and policy. While the PeerTree service is running, committed checks run automatically for each new submitted revision, including revisions received from teammates. Checks run on this Mac from a temporary checkout of the exact commit. The Pipeline tab shows queued and running states and lets you rerun a check manually. A repository without a committed policy keeps the two-reviewer workflow and the manually run fallback pipeline command.
+
+PeerTree's own policy protects `main` and requires one teammate approval plus the lint and test checks. Both run offline on a Mac with the Apple command-line tools, Rust with rustfmt and Clippy, and Node.js.
+
+```sh
+python3 ci/checks.py lint
+python3 ci/checks.py test
+```
 
 ## Clone from a teammate
 
-Use PeerTree 0.4.0 or later on both Macs. The integrator opens an existing working copy with nearby Wi-Fi enabled and chooses **Publish repository snapshot**. Select the branches you were protecting and the default checkout branch. PeerTree can offer local branches and cached `origin` branch tips. The signed snapshot includes those branches' Git history and the local tags reachable from them. It stays current as the integrator publishes branch tips.
+Use PeerTree 0.4.0 or later on both Macs. The integrator opens an existing working copy with nearby Wi-Fi enabled and chooses **Branches → Publish repository snapshot**. Select the branches you were protecting and the default checkout branch. PeerTree can offer local branches and cached `origin` branch tips. The signed snapshot includes those branches' Git history and the local tags reachable from them. It stays current as the integrator publishes branch tips.
 
 On the new Mac, choose **Clone from Teammate** when opening PeerTree from Applications, or run:
 
@@ -134,15 +152,15 @@ On the new Mac, choose **Clone from Teammate** when opening PeerTree from Applic
 peertree clone "./my-project" --project "my-project"
 ```
 
-Use an empty destination and the project name shown on the integrator's screen. Exchange pairing codes, add each other in **Team settings**, and designate the teammate providing the snapshot as integrator. With both apps open nearby, the snapshot arrives automatically. Review the branch and tag counts, then click **Check out repository**. PeerTree creates the protected branches and tags locally and opens the default branch. If direct Wi-Fi is unavailable, the integrator can export the same signed snapshot as a ZIP for the new Mac to import.
+Use an empty destination and the project name shown on the integrator's screen. Exchange pairing codes in **Pair a Mac** and designate the teammate providing the snapshot as integrator in **Settings**. With both apps open nearby, the snapshot arrives automatically. Review the branch and tag counts, then click **Check out repository**. PeerTree creates the protected branches and tags locally and opens the default branch. If direct Wi-Fi is unavailable, the integrator can export the same signed snapshot as a ZIP for the new Mac to import.
 
 Use `--object-format sha256` for a SHA-256 project. PeerTree carries Git refs and tracked files. GitLab access rules, merge request state, CI variables, and runner configuration are server-side. LFS objects and submodule repositories need their own approved transfer.
 
 ## Share a ZIP manually
 
-If AirDrop is approved on your managed Macs, click **Share in Finder**. PeerTree creates a temporary exchange ZIP and selects it in Finder. Choose **Share → AirDrop** and pick the recipient. AirDrop uses Bluetooth and a direct Wi-Fi connection between the Macs, independent of the office network. Keep PeerTree open until the transfer completes.
+If AirDrop is approved on your managed Macs, click **Settings → Share in Finder**. PeerTree creates a temporary exchange ZIP and selects it in Finder. Choose **Share → AirDrop** and pick the recipient. AirDrop uses Bluetooth and a direct Wi-Fi connection between the Macs, independent of the office network. Keep PeerTree open until the transfer completes.
 
-The recipient accepts the AirDrop request, then picks the received ZIP with **Import exchange** or drags it onto that button. A signed exchange still uses the teammate keys you configured earlier. If AirDrop is unavailable, use **Export exchange** to save a ZIP for an approved transfer channel.
+The recipient accepts the AirDrop request, then picks the received ZIP with **Settings → Import exchange** or drags it onto that button. A signed exchange still uses the teammate keys you configured earlier. If AirDrop is unavailable, use **Export exchange** to save a ZIP for an approved transfer channel.
 
 ## Optional alerts on networks that allow peer traffic
 
@@ -153,8 +171,8 @@ Submitting a branch broadcasts a signed alert containing a project fingerprint, 
 ## Review and sync
 
 1. Commit your work on a topic branch and choose **Submit branch for review**. Select the branch and its target. If nearby Wi-Fi is off, share an exchange with both teammates.
-2. Teammates import the ZIP, inspect **Changes**, run the **Pipeline**, then approve or request changes under **Reviews**. The pipeline checks out the exact submitted commit in a temporary directory and runs the locally configured command with your account's permissions. Review the code it will execute first.
+2. Teammates import the ZIP and inspect **Changes** and **Pipeline**, then choose **Approve revision** or **Request changes**. Committed checks run automatically with the account's permissions. For repositories that use a fallback pipeline command, inspect the code and run the pipeline manually.
 3. Review decisions sync to the integrator over nearby Wi-Fi or via ZIP. The integrator can merge after two approvals and no outstanding change request. A new commit submitted from the same topic branch starts a fresh review. **Publish tips** lets the integrator share the current `dev` and `main` tips.
-4. When everyone receives the merged state, choose **Sync dev** or **Sync main** as needed. Sync requires a clean checkout and moves existing branches only by fast-forward. It may switch branches in the selected worktree. If a target branch is already checked out in another worktree, select that worktree first. Resolve divergence or merge conflicts in Git before retrying.
+4. When everyone receives the merged state, choose **Fast-forward** for the relevant branch in **Branches**. Sync requires a clean checkout and moves existing branches only by fast-forward. It may switch branches in the selected worktree. If a target branch is already checked out in another worktree, select that worktree first. Resolve divergence or merge conflicts in Git before retrying.
 
 An exchange forwards the signed records it already holds. Bundles can contain the full histories reachable from shared commits, including earlier versions of deleted files. Exchanges are limited to 512 MB. Git LFS objects and submodule repositories use their own storage and transfer workflows. Hosted GitLab CI runners and services need local equivalents.
