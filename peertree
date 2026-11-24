@@ -13,9 +13,9 @@ for arg in "$@"; do
   case "$arg" in
     --repo|--project|--name|--check|--port|--object-format) skip_value=true ;;
     --agent-help|--version|pr|checks|sync|policy|team|publish)
-      core=${PEERTREE_CORE:-"$app_dir/target/debug/peertree-core"}
+      core=${PEERTREE_CORE:-"$app_dir/target/release/peertree-core"}
       if [ ! -x "$core" ] && [ -z "${PEERTREE_CORE:-}" ]; then
-        core="$app_dir/target/release/peertree-core"
+        core="$app_dir/target/debug/peertree-core"
       fi
       if [ ! -x "$core" ]; then
         echo "Build the PeerTree CLI first with cargo build --locked." >&2
@@ -23,6 +23,7 @@ for arg in "$@"; do
       fi
       export PEERTREE_APP="$app_dir/app.py" PEERTREE_PYTHON=${PEERTREE_PYTHON:-python3}
       if [ "$arg" = --agent-help ]; then exec "$core" --help; fi
+      if [ "$arg" = --version ]; then exec "$core" --version; fi
       exec "$core" "$@"
       ;;
     -*) ;;

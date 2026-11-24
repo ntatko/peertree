@@ -63,11 +63,13 @@ def rust_core(build, output, targets=RUST_TARGETS):
 def rust_desktop(build, output):
     directory = build / "cargo"
     manifest = SOURCE / "desktop" / "Cargo.toml"
+    if not manifest.with_name("Cargo.lock").is_file():
+        raise SystemExit("Commit desktop/Cargo.lock before building a desktop release.")
+    run("cargo", "fetch", "--locked", "--manifest-path", manifest)
     compiled = []
     for target in RUST_TARGETS:
-        flags = ["--locked"] if manifest.with_name("Cargo.lock").is_file() else []
-        run("cargo", "build", "--release", "--manifest-path", manifest, "--features", "custom-protocol",
-            "--target", target, "--target-dir", directory, *flags)
+        run("cargo", "build", "--release", "--locked", "--offline", "--manifest-path", manifest,
+            "--features", "custom-protocol", "--target", target, "--target-dir", directory)
         compiled.append(directory / target / "release" / "peertree-desktop")
     run("/usr/bin/lipo", "-create", *compiled, "-output", output)
 

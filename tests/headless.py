@@ -115,6 +115,11 @@ def run_test(root):
     cli(casey, "pr", "review", pr, "--approve", "--revision", commit)
     cli(casey, "pr", "merge", pr, error="Required checks have not passed")
 
+    # The author's own check results never satisfy the policy.
+    assert cli(alex, "checks", "run", pr)["checks"] == {"lint": True, "test": True}
+    relay(alex, casey, root, "author-checks", {"check"})
+    cli(casey, "pr", "merge", pr, error="Required checks have not passed")
+
     assert cli(blair, "checks", "run", pr)["checks"] == {"lint": True, "test": True}
     relay(blair, casey, root, "checks", {"check"})
     checked = cli(casey, "pr", "show", pr)
@@ -131,7 +136,7 @@ def run_test(root):
     assert cli(casey, "pr", "show", pr)["merged"]
     assert cli(casey, "policy", "show", "--base", "dev")["policy"] == future
 
-    relay(casey, blair, root, "published", {"snapshot", "review"})
+    relay(casey, blair, root, "published", {"snapshot", "review", "check"})
     published = git(casey, "rev-parse", "refs/heads/dev")
     assert git(blair, "rev-parse", "team/dev") == published
     assert git(blair, "rev-parse", "refs/heads/dev") != published

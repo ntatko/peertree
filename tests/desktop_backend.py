@@ -262,11 +262,16 @@ def run_automatic_pipeline_test(folder):
         assert workspace.run_check(second_id, automatic=True) is None
 
         assert web_request(receiver, "/api/import", web_request(workspace, "/api/export")[1])[0] == 200
-        completed = run_for(receiver, second_id)
+        # A teammate's revision waits for the reviewer to start its checks.
+        receiver.check_wake.set()
+        time.sleep(0.5)
+        with receiver.lock:
+            assert not receiver.data_state["runs"]
+            assert {row["id"]: row["pipeline_status"] for row in receiver.view()["proposals"]}[second_id] is None
+        assert receiver.run_check(second_id, automatic=True) is None
+        completed = receiver.run_check(second_id)
         assert completed["checks"] == {"test": False} and "second" in completed["output"]
         assert first_id not in receiver.data_state["runs"]
-        assert receiver.run_check(second_id, automatic=True) is None
-        assert receiver.run_check(second_id)["checks"] == {"test": False}
     finally:
         workspace.stop_checks()
         receiver.stop_checks()

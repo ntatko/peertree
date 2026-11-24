@@ -740,7 +740,7 @@ class Workspace:
             for key, item in self.records.items():
                 record = item["record"]
                 if (record["kind"] == "check" and record["proposal"] == ident
-                        and record["policy"] == policy_id
+                        and record["policy"] == policy_id and record["who"] != proposal["who"]
                         and (record["who"] == self.me or record["who"] in self.data_state["peers"])):
                     for check, passed in record["results"].items():
                         slot = (record["who"], check)
@@ -868,8 +868,11 @@ class Workspace:
                 command = self.data_state["check"]
                 root = worktree or self.root
                 if automatic:
+                    # Checks execute the submitted revision's code, so only the author's
+                    # own branches run unattended. Reviewers start teammates' runs.
                     run = self.data_state["runs"].get(ident, {})
-                    if (self.data_state.get("bootstrap") or not policy or not policy[1]["checks"]
+                    if (proposal["who"] != self.me or self.data_state.get("bootstrap")
+                            or not policy or not policy[1]["checks"]
                             or run.get("policy") == policy[0] or ident not in self.revisions()
                             or self.quorum_stale(proposal)
                             or self.merged_proposal(proposal, self.branches(), self.shared())):
@@ -1031,7 +1034,8 @@ class Workspace:
                     for ident in value["checks"]:
                         result = records.get(ident, {})
                         if (result.get("kind") == "check" and result["proposal"] == value["proposal"]
-                                and result["policy"] == policy_id and result["who"] in members):
+                                and result["policy"] == policy_id and result["who"] in members
+                                and result["who"] != proposal["who"]):
                             passed.update(name for name, ok in result["results"].items() if ok)
                     eligible = (approval.get("policy") == policy_id and names <= passed
                                 and (not policy or branch in policy[1]["protected_branches"])
@@ -1070,7 +1074,8 @@ class Workspace:
             passed = {}
             for check_id, envelope in self.records.items():
                 check = envelope["record"]
-                if check["kind"] != "check" or check["proposal"] != ident or check["policy"] != policy_id:
+                if (check["kind"] != "check" or check["proposal"] != ident or check["policy"] != policy_id
+                        or check["who"] == record["who"]):
                     continue
                 for name, result in check["results"].items():
                     key = (name, check["who"])
@@ -1619,7 +1624,8 @@ class Workspace:
             checks = list(policy[1]["checks"]) if policy else []
             run = self.data_state["runs"].get(ident)
             pipeline_status = "running" if self.running_check == ident else None
-            if (not pipeline_status and self.check_worker and not self.data_state.get("bootstrap")
+            if (not pipeline_status and self.check_worker and record["who"] == self.me
+                    and not self.data_state.get("bootstrap")
                     and not merged and not stale and ident in revisions and not issue and checks
                     and (not run or run.get("policy") != policy[0])):
                 pipeline_status = "queued"

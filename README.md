@@ -13,7 +13,7 @@ brew install --cask ntatko/peertree/peertree
 
 The cask installs **PeerTree.app** and links the `peertree` command. It supports Apple Silicon and Intel on macOS 15 or later. PeerTree uses the Mac's Python 3.9+, Git, and OpenSSH. The Command Line Tools provide these dependencies.
 
-To run directly from source, build the core with `cargo build --locked --offline` and use the checked-in `./peertree` launcher. Nearby Wi-Fi builds its native helper on demand using the Apple Swift toolchain. The current GitHub cask points to the last published version. The agent commands below are in the 0.5.0 source.
+To run directly from source, build the core with `cargo build --locked --offline` and use the checked-in `./peertree` launcher. Nearby Wi-Fi builds its native helper on demand using the Apple Swift toolchain.
 
 The headless smoke test transfers signed exchanges through three disposable clones. Run it with `python3 -B tests/headless.py` after building the core.
 
@@ -32,7 +32,7 @@ The first desktop build resolves Tauri crates from crates.io. To open a specific
 
 Install the Rust standard libraries for Apple Silicon and Intel on the build Mac before packaging. With rustup, run `rustup target add aarch64-apple-darwin x86_64-apple-darwin`. The Rust core builds offline with the checked-in lockfile.
 
-Pass `--desktop` to bundle the Tauri preview with the usual Homebrew CLI. For a signed release, first test the windowed build on the signing Mac and check in the generated `desktop/Cargo.lock` so both architectures use the same dependency versions.
+Pass `--desktop` to bundle the Tauri preview with the usual Homebrew CLI. Desktop releases build from the committed `desktop/Cargo.lock`, so update it deliberately with `cargo update --manifest-path desktop/Cargo.toml`.
 
 ```sh
 python3 package-brew.py --owner ntatko
@@ -133,7 +133,7 @@ peertree publish --branch main --branch dev --default main
 peertree policy show --base dev --json
 ```
 
-The last published target commit supplies the active policy. A branch can change this file through review. Its old policy continues to govern the merge, and signed checks and approvals count against the reviewed commit and policy. While the PeerTree service is running, committed checks run automatically for each new submitted revision, including revisions received from teammates. Checks run on this Mac from a temporary checkout of the exact commit. The Pipeline tab shows queued and running states and lets you rerun a check manually. A repository without a committed policy keeps the two-reviewer workflow and the manually run fallback pipeline command.
+The last published target commit supplies the active policy. A branch can change this file through review. Its old policy continues to govern the merge, and signed checks and approvals count against the reviewed commit and policy. While the PeerTree service is running, committed checks run automatically for each revision you submit. Checks execute the submitted commit's code, so a teammate's revision waits until you review it and click **Run local pipeline**. Checks run on this Mac from a temporary checkout of the exact commit, and only results signed by someone other than the author count toward the policy. The Pipeline tab shows queued and running states and lets you rerun a check manually. A repository without a committed policy keeps the two-reviewer workflow and the manually run fallback pipeline command.
 
 PeerTree's own policy protects `main` and requires one teammate approval plus the lint and test checks. Both run offline on a Mac with the Apple command-line tools, Rust with rustfmt and Clippy, and Node.js.
 
@@ -144,7 +144,7 @@ python3 ci/checks.py test
 
 ## Clone from a teammate
 
-Use PeerTree 0.4.0 or later on both Macs. The integrator opens an existing working copy with nearby Wi-Fi enabled and chooses **Branches → Publish repository snapshot**. Select the branches you were protecting and the default checkout branch. PeerTree can offer local branches and cached `origin` branch tips. The signed snapshot includes those branches' Git history and the local tags reachable from them. It stays current as the integrator publishes branch tips.
+Use PeerTree 0.5.0 or later on every Mac. The integrator opens an existing working copy with nearby Wi-Fi enabled and chooses **Branches → Publish repository snapshot**. Select the branches you were protecting and the default checkout branch. PeerTree can offer local branches and cached `origin` branch tips. The signed snapshot includes those branches' Git history and the local tags reachable from them. It stays current as the integrator publishes branch tips.
 
 On the new Mac, choose **Clone from Teammate** when opening PeerTree from Applications, or run:
 
@@ -171,7 +171,7 @@ Submitting a branch broadcasts a signed alert containing a project fingerprint, 
 ## Review and sync
 
 1. Commit your work on a topic branch and choose **Submit branch for review**. Select the branch and its target. If nearby Wi-Fi is off, share an exchange with both teammates.
-2. Teammates import the ZIP and inspect **Changes** and **Pipeline**, then choose **Approve revision** or **Request changes**. Committed checks run automatically with the account's permissions. For repositories that use a fallback pipeline command, inspect the code and run the pipeline manually.
+2. Teammates import the ZIP and inspect **Changes** and **Pipeline**, then choose **Approve revision** or **Request changes**. Inspect the code before running the pipeline, since checks run with the account's permissions.
 3. Review decisions sync to the integrator over nearby Wi-Fi or via ZIP. The integrator can merge after two approvals and no outstanding change request. A new commit submitted from the same topic branch starts a fresh review. **Publish tips** lets the integrator share the current `dev` and `main` tips.
 4. When everyone receives the merged state, choose **Fast-forward** for the relevant branch in **Branches**. Sync requires a clean checkout and moves existing branches only by fast-forward. It may switch branches in the selected worktree. If a target branch is already checked out in another worktree, select that worktree first. Resolve divergence or merge conflicts in Git before retrying.
 

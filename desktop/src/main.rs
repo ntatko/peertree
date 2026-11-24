@@ -37,10 +37,13 @@ fn from_launcher(window: &WebviewWindow) -> Result<(), String> {
 
 fn service_script(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let resource = app.path().resource_dir().ok().map(|dir| dir.join("app.py"));
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../app.py");
+    #[cfg(debug_assertions)]
+    let source = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../app.py"));
+    #[cfg(not(debug_assertions))]
+    let source = None;
     resource
         .into_iter()
-        .chain([source])
+        .chain(source)
         .find(|path| path.is_file())
         .ok_or_else(|| "The PeerTree repository service is missing from this app.".into())
 }

@@ -124,6 +124,12 @@ async function refresh() {
   render();
 }
 
+// A refresh rebuilds review panels, so wait until typed comments are sent or cleared.
+function unsentComment() {
+  return [...document.querySelectorAll(".comment-form textarea, .inline-editor textarea")]
+    .some(field => field.value.trim());
+}
+
 async function checkNearby() {
   if (nearbyPolling) return;
   nearbyPolling = true;
@@ -152,7 +158,8 @@ async function checkNearby() {
         : "Nearby Wi-Fi is off. Start PeerTree with nearby Wi-Fi enabled to sync directly."));
     }
     if (state && version !== state.version && !busy &&
-        !document.querySelector("dialog[open]") && !document.activeElement?.matches("input,textarea,select")) {
+        !document.querySelector("dialog[open]") && !document.activeElement?.matches("input,textarea,select") &&
+        !unsentComment()) {
       const previous = state;
       await refresh();
       announceChanges(previous);
@@ -547,7 +554,10 @@ function syntaxMatcher(mode) {
 const literalWords = new Set("true false null undefined nil none nullptr".split(" "));
 const syntaxKeywords = new Map(Object.entries(syntaxWords).map(([language, words]) => {
   const inherited = language === "typescript" ? syntaxWords.javascript : language === "cpp" ? syntaxWords.c : "";
-  return [language, new Set((inherited + " " + words).trim().toLowerCase().split(" "))];
+  const list = (inherited + " " + words).trim();
+  // Only SQL and Dockerfile keywords are case-insensitive; Rust and Swift need `Self`.
+  const caseless = language === "sql" || language === "dockerfile";
+  return [language, new Set((caseless ? list.toLowerCase() : list).split(" "))];
 }));
 
 function highlightedCode(text, hint = "") {
@@ -948,7 +958,8 @@ function renderCode(node, workspace, theme) {
   layout.append(tree, panel);
   node.replaceChildren(layout);
   tree.scrollTop = treeScroll;
-  if (codeAnchor) scrollToCodeAnchor(codeAnchor);
+  // Scroll to a followed link once, so later refreshes keep the reader's position.
+  if (scrollToCodeAnchor(codeAnchor)) codeAnchor = "";
 }
 
 function renderHistory(node, rows) {
@@ -1567,6 +1578,9 @@ function renderPipeline(body, proposal) {
     body.append(element("p", proposal.checks.length
       ? "Required checks · " + proposal.checks.join(", ") : "This policy has no required checks.", "help"));
     if (proposal.missing.length) body.append(element("p", "Waiting for · " + proposal.missing.join(", "), "help"));
+    if (proposal.who !== state.me && proposal.checks.length && !currentRun(proposal)) {
+      body.append(element("p", "Checks run this branch's code on your Mac. Review the changes, then run the pipeline.", "help"));
+    }
   } else {
     const shared = state.shared[proposal.target];
     const tip = shared || state.branches[proposal.target];
