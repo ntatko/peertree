@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import zipfile
 
 
@@ -131,6 +132,9 @@ class PeerSession:
             self.run_session()
         except (OSError, ValueError, RuntimeError) as error:
             self.error = str(error)
+        except Exception as error:  # Show unexpected failures instead of stopping sync silently.
+            traceback.print_exc()
+            self.error = f"Nearby Wi-Fi stopped unexpectedly. {type(error).__name__}: {error}"
         finally:
             self.initializing = False
 
@@ -213,9 +217,9 @@ class PeerSession:
                 previous_exports = exports
             self.stopped.wait(1)
 
-    def prepare_exports(self, directory, peers, inventory, local, plans):
+    def prepare_exports(self, directory, peers, inventory, records, plans):
         exports = {}
-        local = hashlib.sha256(inventory).digest()
+        digest = hashlib.sha256(inventory).digest()
         for peer in tuple(plans):
             if peer not in peers:
                 del plans[peer]
@@ -229,14 +233,14 @@ class PeerSession:
                 continue
             if len(remote) > MAX_INVENTORY:
                 continue
-            generation = hashlib.sha256(local + pin.encode() + remote).hexdigest()
+            generation = hashlib.sha256(digest + pin.encode() + remote).hexdigest()
             cached = plans.get(peer)
             if cached and cached[0] == generation and (not cached[2] or time.monotonic() < cached[2]):
                 if cached[1]:
                     exports[peer] = cached[1]
                 continue
             try:
-                plan = self.workspace.inventory_plan(json.loads(remote), local)
+                plan = self.workspace.inventory_plan(json.loads(remote), records)
                 if not plan["missing"]:
                     plans[peer] = (generation, None, 0)
                     continue

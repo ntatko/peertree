@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import agent
 import app
+import peer as nearby
 
 
 class LocalServer:
@@ -308,11 +309,24 @@ def run_batched_catch_up_test(folder):
             ident = workspace.create({"source": f"feature-{number}", "target": "main", "title": f"Change {number}"})
             for reply in range(3):
                 workspace.comment({"id": ident["selected"], "body": f"Note {number}.{reply}"})
-        # A tiny packet budget makes the teammate catch up over several exchanges.
-        batches = []
+        # A tiny packet budget makes the teammate catch up over several nearby exchanges,
+        # driven through the same export planning the Wi-Fi loop uses.
+        session = nearby.PeerSession(workspace, app.run)
+        exchange = folder / "exchange"
+        (exchange / "inventories").mkdir(parents=True)
+        (exchange / "outgoing").mkdir()
+        plans, batches = {}, []
         with patch.object(app, "MAX_RECORDS", 3000):
-            while (plan := workspace.inventory_plan(list(receiver.records)))["missing"]:
-                payload = workspace.export(plan)
+            while True:
+                remote = json.dumps(sorted(receiver.records), separators=(",", ":")).encode()
+                (exchange / "inventories" / "receiver.json").write_bytes(remote)
+                local = sorted(workspace.records)
+                inventory = json.dumps(local, separators=(",", ":")).encode()
+                exports = session.prepare_exports(exchange, {"receiver": "0" * 64}, inventory, local, plans)
+                assert not session.error, session.error
+                if not exports:
+                    break
+                payload = (exchange / "outgoing" / exports["receiver"]).read_bytes()
                 with ZipFile(io.BytesIO(payload)) as archive:
                     batches.append([item["record"]["kind"] for item in json.loads(archive.read("records.json"))])
                 assert receiver.import_exchange(payload)["imported"] == len(batches[-1])
