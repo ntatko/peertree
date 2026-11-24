@@ -49,22 +49,35 @@
       <div id="divergence" class="divergence" hidden>
         <span id="divergence-text"></span><button id="divergence-open" class="quiet">Review divergence →</button>
       </div>
-      <section data-screen="clone" class="panel empty-detail" aria-label="First repository checkout" hidden>
-        <h2 id="clone-title">Pair with the integrator</h2>
-        <p class="help" id="clone-status"></p>
-        <form id="join-code-form" class="row join-code" hidden>
+      <section data-screen="clone" aria-label="First repository checkout" hidden>
+       <div id="join-panel" class="join-card" aria-live="polite" hidden>
+        <div id="join-icon" class="status-icon waiting" aria-hidden="true"></div>
+        <h2 id="join-title">Waiting for a teammate</h2>
+        <p class="help" id="join-status"></p>
+        <p id="join-name" class="join-name" hidden></p>
+        <form id="join-code-form" class="join-code" hidden>
           <label class="visually-hidden" for="join-code">Code shown on the host Mac</label>
           <input id="join-code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="000 000" required>
-          <button type="submit" class="primary">Enter code</button>
-          <button id="join-cancel" type="button">Cancel</button>
+          <p id="join-error" class="field-error" role="alert" hidden></p>
+          <div class="join-actions">
+            <button id="join-cancel" type="button">Cancel</button>
+            <button type="submit" class="primary">Continue</button>
+          </div>
         </form>
+        <div id="join-folder" class="join-actions" hidden>
+          <button id="clone-folder" type="button" class="primary">Choose folder…</button>
+        </div>
+       </div>
+       <div id="clone-panel" class="panel empty-detail">
+        <h2 id="clone-title">Pair with the integrator</h2>
+        <p class="help" id="clone-status"></p>
         <div class="row">
-          <button id="clone-folder" type="button" class="primary" hidden>Choose folder…</button>
           <button id="clone-pair" type="button">Pair a Mac</button>
           <button id="clone-settings" type="button">Configure team</button>
           <button id="clone-import" type="button">Import exchange</button>
           <button id="clone-checkout" type="button" class="primary" hidden>Check out repository</button>
         </div>
+       </div>
       </section>
       <section data-screen="code" id="code" aria-label="Repository files" hidden></section>
       <section data-screen="history" id="history" aria-label="Commit history" hidden></section>
@@ -226,21 +239,34 @@
 
   <dialog id="team-dialog">
     <div class="dialog-heading"><h2>Add a teammate</h2><button class="quiet close" type="button" aria-label="Close">×</button></div>
-    <section id="pair-nearby" aria-live="polite">
-      <p class="help" id="pair-help">On the other Mac, open PeerTree and choose <strong>Join a teammate</strong>. It appears here when it's ready.</p>
-      <ul id="pair-requests" class="pair-requests"></ul>
+    <section id="pair-nearby" class="pair-nearby" aria-live="polite">
+      <div id="pair-list">
+        <p class="help">On the other Mac, open PeerTree and choose <strong>Join a teammate's project</strong>.</p>
+        <h3 class="pair-subhead">Nearby Macs</h3>
+        <ul id="pair-requests" class="pair-requests"></ul>
+        <p id="pair-searching" class="pair-searching"><span class="pulse" aria-hidden="true"></span><span id="pair-searching-text">Looking for Macs waiting to join…</span></p>
+      </div>
       <div id="pair-verify" class="pair-verify" hidden>
-        <p>On <strong id="pair-peer"></strong>, type this code:</p>
+        <p>Type this code on <strong id="pair-peer"></strong></p>
         <p id="pair-code" class="pair-code"></p>
-        <p class="help">Confirm once the other Mac shows <strong>Code accepted</strong>.</p>
-        <div class="row">
-          <button id="pair-confirm" type="button" class="primary">The other Mac accepted the code</button>
+        <p class="help" id="pair-verify-help">Confirm once the other Mac shows <strong>Code accepted</strong>.</p>
+        <div class="dialog-actions">
           <button id="pair-cancel" type="button">Cancel</button>
+          <button id="pair-confirm" type="button" class="primary">Confirm</button>
         </div>
       </div>
-      <p id="pair-state" class="help" role="status"></p>
+      <div id="pair-done" class="pair-done" hidden>
+        <div class="status-icon ok" aria-hidden="true"></div>
+        <p><strong id="pair-done-title"></strong></p>
+        <p class="help">It starts receiving the project now. Your other teammates learn about it on their next sync.</p>
+        <div class="dialog-actions">
+          <button id="pair-another" type="button">Add another</button>
+          <button id="pair-finish" type="button" class="primary">Done</button>
+        </div>
+      </div>
+      <p id="pair-error" class="field-error" role="alert" hidden></p>
     </section>
-    <details class="settings-section">
+    <details id="pair-manual" class="settings-section">
       <summary>Pair without nearby Wi-Fi</summary>
       <p class="help">For exchanges shared by AirDrop. Compare public keys in person.</p>
       <label>Your public key<input id="public-key" readonly></label>

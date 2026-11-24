@@ -282,7 +282,9 @@ function render() {
   byId("project").textContent = state.project;
   byId("repo-caption").textContent = state.bootstrap ? "Initial checkout"
     : displayedStorage ? "Local replica · " + formatBytes(displayedStorage.repository) : "Local repository";
-  byId("page-title").textContent = views[view];
+  const joinFlow = !!(state.joining || state.staging);
+  byId("page-title").textContent = view === "clone" && joinFlow ? "Join a project" : views[view];
+  document.querySelector('[data-view="clone"]').lastChild.textContent = joinFlow ? "Join a project" : views.clone;
   byId("page-subtitle").textContent = {
     code: "Browse the committed files in the selected worktree",
     history: "Recent commits in the selected worktree",
@@ -290,7 +292,7 @@ function render() {
     reviews: open + " open" + (required ? " · " + required + (required === 1 ? " approval" : " approvals") + " to merge" : ""),
     peers: "Trusted identities and recent sync activity",
     settings: "This Mac · " + name(state.me),
-    clone: state.project,
+    clone: state.joining ? "Nearby Wi-Fi" : state.project,
   }[view];
   for (const section of document.querySelectorAll("[data-screen]")) section.hidden = section.dataset.screen !== view;
   for (const item of document.querySelectorAll("[data-view]")) {
@@ -1127,30 +1129,13 @@ function reviewBlockers(proposal) {
 function renderClone() {
   const { integrator, snapshot } = state;
   const checkout = byId("clone-checkout");
-  const joinFlow = state.joining || state.staging;
-  for (const id of ["clone-pair", "clone-settings", "clone-import"]) byId(id).hidden = joinFlow;
-  byId("join-code-form").hidden = true;
-  byId("clone-folder").hidden = !state.staging || state.joining;
-  checkout.hidden = !snapshot || state.staging;
-  if (joinFlow && !pairingTimer) pollPairing();
-  if (state.joining) {
-    const session = pairing?.session || {};
-    const active = session.role === "join" ? session.state : "";
-    byId("join-code-form").hidden = active !== "verify";
-    byId("clone-title").textContent = active === "verify" ? "Enter the code from the host"
-      : active === "waiting" ? "Code accepted" : "Waiting for a teammate";
-    byId("clone-status").textContent = active === "verify"
-      ? "Type the six-digit code shown on the host Mac."
-      : active === "waiting" ? "Waiting for the host to confirm…"
-        : active === "connecting" ? "A teammate is connecting…"
-          : (active === "failed" ? session.error + " " : "") + "On the host Mac, choose Add a teammate and select " +
-            (pairing?.display ? "“" + pairing.display + "”" : "this Mac") + ".";
-    return;
-  }
-  if (state.staging) {
-    byId("clone-title").textContent = "Joined " + state.project;
-    byId("clone-status").textContent = (snapshot ? "The repository has arrived. " : "Receiving " + state.project +
-      " from " + name(integrator) + "… ") + "Choose where it should live on this Mac.";
+  const joinFlow = !!(state.joining || state.staging);
+  byId("join-panel").hidden = !joinFlow;
+  byId("clone-panel").hidden = joinFlow;
+  checkout.hidden = !snapshot;
+  if (joinFlow) {
+    if (!pairingTimer) pollPairing();
+    renderJoin(snapshot);
     return;
   }
   if (state.quorum && snapshot) {
@@ -1170,6 +1155,45 @@ function renderClone() {
       snapshot.tags + " tags. PeerTree will check out " + snapshot.default + " in " + state.repo + "."
     : integrator ? "Keep PeerTree open nearby while " + name(integrator) + " publishes the repository snapshot."
       : "Pair with both teammates, then join the starting snapshot in Team settings.";
+}
+
+// The joining Mac's steps: wait to be picked, type the host's code, then choose a folder.
+function renderJoin(snapshot) {
+  const session = pairing?.session?.role === "join" ? pairing.session : {};
+  const step = state.joining ? session.state || "" : "joined";
+  const field = byId("join-code");
+  const codeForm = byId("join-code-form");
+  const entering = step === "verify";
+  if (entering && codeForm.hidden) setTimeout(() => field.focus(), 0);
+  codeForm.hidden = !entering;
+  byId("join-folder").hidden = step !== "joined";
+  const name = byId("join-name");
+  name.hidden = step !== "" && step !== "failed";
+  name.textContent = pairing?.display || "";
+  const icon = byId("join-icon");
+  icon.className = "status-icon " + ({ verify: "code", waiting: "ok", joined: "ok", failed: "alert" }[step] || "waiting");
+  byId("join-title").textContent = {
+    connecting: "A teammate is connecting…",
+    verify: "Enter the code",
+    waiting: "Code accepted",
+    joined: "Joined " + state.project,
+    failed: "Pairing stopped",
+  }[step] || "Waiting for a teammate";
+  byId("join-status").textContent = {
+    connecting: "Hold on while the two Macs set up a secure connection.",
+    verify: "Type the six-digit code shown on the host Mac.",
+    waiting: "Waiting for the host to confirm…",
+    joined: (snapshot ? "The repository has arrived. " : "Receiving " + state.project + " from " +
+      name_(state.integrator) + "… ") + "Choose where it should live on this Mac.",
+    failed: (session.error || "The host cancelled.") + " On the host Mac, choose Add a teammate and select:",
+  }[step] || "On the host Mac, choose Add a teammate and select:";
+  const error = byId("join-error");
+  error.hidden = !(entering && joinError);
+  error.textContent = joinError;
+}
+
+function name_(id) {
+  return id ? name(id) : "your teammate";
 }
 
 function renderQuorumSettings() {
@@ -1701,8 +1725,7 @@ function openTeam() {
   if (!state) return;
   setupTeam();
   byId("key-status").textContent = "";
-  pairingShown = "";
-  renderPairing(null);
+  resetPairingDialog();
   byId("team-dialog").showModal();
   pollPairing();
 }
@@ -1711,7 +1734,8 @@ function openTeam() {
 // Mac types it and the host confirms, so a device in between can't pair itself with either.
 let pairingTimer;
 let pairing;
-let pairingShown = "";
+let dismissedSession = "";
+let joinError = "";
 
 function pairingWanted() {
   return byId("team-dialog").open || !!(state?.joining || state?.staging);
@@ -1719,18 +1743,14 @@ function pairingWanted() {
 
 async function pollPairing() {
   clearTimeout(pairingTimer);
+  pairingTimer = undefined;
   if (!state || !pairingWanted()) return;
   try {
     if (byId("team-dialog").open) await api("pairing", { action: "host" });
-    const previous = pairing;
+    const previous = pairing?.result;
     pairing = await api("pairing");
-    const result = pairing.result;
-    const key = result ? (result.error || result.message) : "";
-    if (key && key !== pairingShown && previous) {
-      pairingShown = key;
-      notify(key, !!result.error);
-      if (!result.error) await refresh();
-    }
+    if (pairing.result && !pairing.result.error && pairing.result !== previous &&
+        JSON.stringify(pairing.result) !== JSON.stringify(previous)) await refresh();
     renderPairing(pairing);
     if (view === "clone") renderClone();
   } catch (error) {
@@ -1739,39 +1759,67 @@ async function pollPairing() {
   pairingTimer = setTimeout(pollPairing, 1000);
 }
 
+function initials(text) {
+  return text.split(/[\s·@._-]+/).filter(Boolean).slice(0, 2).map(word => word[0].toUpperCase()).join("") || "?";
+}
+
 function renderPairing(status) {
   const session = status?.session || {};
-  const hosting = session.role === "host" && ["connecting", "verify", "waiting"].includes(session.state);
-  const list = byId("pair-requests");
+  const current = session.role === "host" && session.session !== dismissedSession ? session.state : "";
+  const verifying = ["connecting", "verify", "waiting"].includes(current);
+  const done = current === "paired" && !status?.result?.error;
+  byId("pair-list").hidden = verifying || done;
+  byId("pair-verify").hidden = !verifying;
+  byId("pair-done").hidden = !done;
+  byId("pair-manual").hidden = verifying || done;
+
   const requests = status?.requests || [];
-  list.replaceChildren(...requests.map(request => {
+  byId("pair-requests").replaceChildren(...requests.map(request => {
+    const row = element("button", null, "pair-request");
+    row.type = "button";
+    const text = element("span", null, "pair-request-text");
+    text.append(element("strong", request.name), element("span", "Waiting to join", "help"));
+    row.append(element("span", initials(request.name), "avatar"), text, element("span", "Add", "pair-request-add"));
+    row.addEventListener("click", () => pairAction({ action: "start", id: request.id }));
     const item = element("li");
-    item.append(button(request.name, () => pairAction({ action: "start", id: request.id }), "pair-request"));
+    item.append(row);
     return item;
   }));
-  list.hidden = hosting || !requests.length;
-  byId("pair-help").hidden = hosting;
-  byId("pair-verify").hidden = !(hosting && session.state !== "connecting");
-  byId("pair-peer").textContent = session.peer || "the other Mac";
-  byId("pair-code").textContent = session.code ? session.code.slice(0, 3) + " " + session.code.slice(3) : "";
-  byId("pair-confirm").disabled = session.state !== "verify";
-  let message = "";
-  if (status && !status.available) message = status.error || "Turn on nearby Wi-Fi to pair Macs nearby.";
-  else if (hosting && session.state === "connecting") message = "Connecting to " + (session.peer || "the other Mac") + "…";
-  else if (hosting && session.state === "waiting") message = "Confirmed here. Waiting for the other Mac…";
-  else if (session.role === "host" && session.state === "failed") message = session.error;
-  else if (session.role === "host" && session.state === "paired") message = status.result?.error || status.result?.message || "";
-  else if (status && !requests.length) message = "Looking for Macs waiting to join…";
-  byId("pair-state").textContent = message;
+  byId("pair-searching").hidden = requests.length > 0;
+  byId("pair-searching-text").textContent = status && !status.available
+    ? status.error || "Turn on nearby Wi-Fi to find Macs nearby." : "Looking for Macs waiting to join…";
+
+  const peer = session.peer || "the other Mac";
+  byId("pair-peer").textContent = peer;
+  byId("pair-code").textContent = current === "connecting" ? "··· ···"
+    : session.code ? session.code.slice(0, 3) + " " + session.code.slice(3) : "";
+  byId("pair-code").classList.toggle("pending", current === "connecting");
+  byId("pair-verify-help").textContent = current === "connecting" ? "Connecting to " + peer + "…"
+    : current === "waiting" ? "Confirmed here. Finishing on " + peer + "…"
+      : "Confirm once the other Mac shows “Code accepted”.";
+  byId("pair-confirm").disabled = current !== "verify";
+  byId("pair-done-title").textContent = (status?.result?.name || peer) + " joined " + (state?.project || "the project") + ".";
+
+  const failed = current === "failed" ? session.error : current === "paired" ? status?.result?.error : "";
+  const error = byId("pair-error");
+  error.hidden = !failed;
+  error.textContent = failed || "";
 }
 
 async function pairAction(input) {
+  byId("pair-error").hidden = true;
   try {
     await api("pairing", input);
   } catch (error) {
-    notify(error.message, true);
+    byId("pair-error").hidden = false;
+    byId("pair-error").textContent = error.message;
   }
   pollPairing();
+}
+
+function resetPairingDialog() {
+  dismissedSession = pairing?.session?.session || "";
+  renderPairing(pairing ? { ...pairing, requests: [] } : null);
 }
 
 byId("team-dialog").addEventListener("close", () => {
@@ -1781,19 +1829,37 @@ byId("team-dialog").addEventListener("close", () => {
 });
 byId("pair-confirm").addEventListener("click", () => pairAction({ action: "confirm" }));
 byId("pair-cancel").addEventListener("click", () => pairAction({ action: "cancel" }));
+byId("pair-another").addEventListener("click", resetPairingDialog);
+byId("pair-finish").addEventListener("click", () => byId("team-dialog").close());
+byId("join-code").addEventListener("input", event => {
+  // Keep only digits and show them as 123 456.
+  const digits = event.target.value.replace(/\D/g, "").slice(0, 6);
+  event.target.value = digits.length > 3 ? digits.slice(0, 3) + " " + digits.slice(3) : digits;
+  joinError = "";
+  byId("join-error").hidden = true;
+});
 byId("join-code-form").addEventListener("submit", async event => {
   event.preventDefault();
   const field = byId("join-code");
   try {
     await api("pairing", { action: "confirm", code: field.value });
     field.value = "";
+    joinError = "";
   } catch (error) {
-    notify(error.message, true);
-    field.select();
+    joinError = error.message;
+    field.focus();
   }
   pollPairing();
 });
-byId("join-cancel").addEventListener("click", () => pairAction({ action: "cancel" }));
+byId("join-cancel").addEventListener("click", async () => {
+  joinError = "";
+  try {
+    await api("pairing", { action: "cancel" });
+  } catch {
+    // The host may already have ended the attempt.
+  }
+  pollPairing();
+});
 byId("clone-folder").addEventListener("click", () => change("destination", {}, null, "Choose a folder in the dialog…"));
 byId("team-open").addEventListener("click", openTeam);
 byId("quorum-snapshot").addEventListener("change", updateQuorumSnapshot);
