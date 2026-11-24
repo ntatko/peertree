@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PeerTree</title>
+  <link rel="stylesheet" href="launcher.css">
+  <script src="launcher.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <img src="peertree-icon.png" width="44" height="44" alt="">
+      <h1>PeerTree</h1>
+    </header>
+    <form>
+      <fieldset>
+        <legend>Workspace</legend>
+        <label class="choice"><input type="radio" name="mode" value="open" checked> Open a Git worktree</label>
+        <label class="choice"><input type="radio" name="mode" value="clone"> Clone from a teammate</label>
+      </fieldset>
+      <label for="folder">Folder</label>
+      <div class="path">
+        <input id="folder" required spellcheck="false" placeholder="/Users/you/projects/my-project">
+        <button id="choose" type="button">Choose…</button>
+      </div>
+      <div id="clone-fields" hidden>
+        <label for="project">Project name</label>
+        <input id="project" maxlength="80" autocomplete="off">
+        <p>Enter the project name shown on your integrator’s PeerTree window.</p>
+      </div>
+      <label class="choice"><input type="checkbox" id="peer"> Enable nearby Wi-Fi</label>
+      <div class="actions">
+        <button id="open" type="submit">Open worktree</button>
+      </div>
+      <p id="status" role="status" aria-live="polite" hidden></p>
+    </form>
+  </main>
+</body>
+</html>

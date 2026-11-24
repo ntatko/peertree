@@ -9,6 +9,6 @@
     <key>NSLocalNetworkUsageDescription</key>
     <string>Find paired teammates and exchange Git reviews over nearby peer-to-peer Wi-Fi.</string>
     <key>NSBonjourServices</key>
-    <array><string>_neighbor-review._tcp</string></array>
+    <array><string>_peertree-v2._tcp</string></array>
 </dict>
 </plist>

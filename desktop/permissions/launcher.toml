@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "workspace-launcher"
+description = "Choose a folder and open it in a local PeerTree session."
+commands.allow = ["initial_workspace", "choose_folder", "open_workspace"]

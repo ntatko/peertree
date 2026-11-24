@@ -1,0 +1,9 @@
+[package]
+name = "peertree"
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.82"
+
+[[bin]]
+name = "peertree-core"
+path = "src/main.rs"

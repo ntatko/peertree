@@ -1,0 +1,6 @@
+{
+  "identifier": "launcher",
+  "description": "Open a repository from the bundled PeerTree launcher.",
+  "windows": ["launcher"],
+  "permissions": ["workspace-launcher"]
+}
