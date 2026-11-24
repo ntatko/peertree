@@ -1,6 +1,6 @@
 cask "peertree@beta" do
-  version "0.5.1-beta.1"
-  sha256 "f4c4d546966ce2c4efec6a446f84fa1925b30f731207126336c69b0c25bd1177"
+  version "0.5.1-beta.2"
+  sha256 "d32e3c346e868f2b1d9075ad2f565d443ac042df99cb119c50e2ed108b1a6fd0"
 
   url "https://github.com/ntatko/peertree/releases/download/v#{version}/PeerTree-#{version}-macOS.zip"
   name "PeerTree Beta"
